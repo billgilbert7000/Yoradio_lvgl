@@ -34,6 +34,13 @@ bool      s_f_oggFirstPage = false;
 bool      s_f_oggContinuedPage = false;
 bool      s_f_oggLastPage = false;
 bool      s_f_parseOggDone = true;
+// E-VS3: latched once the setup header could not be parsed. Vorbis cannot decode a
+// single packet without the codebook/floor/residue tables it carries, so the player
+// is told to re-open the stream instead of waiting for the next header chain.
+// E-VS3: взводится, когда setup-заголовок не разобран. Без его таблиц Vorbis не
+// декодирует ни одного пакета, поэтому плееру сообщаем переоткрыть поток, а не
+// ждать следующую цепочку заголовков.
+bool      s_f_vorbisSetupHeaderFailed = false;
 bool      s_f_lastSegmentTable = false;
 bool      s_f_vorbisStr_found = false;
 uint16_t  s_identificatonHeaderLength = 0;
@@ -77,6 +84,20 @@ bitReader_t            s_bitReader;
 
 ps_ptr<char>                  s_vorbisChbuf;
 ps_ptr<uint8_t>               s_lastSegmentTable;
+// E-VS5: capacity of the deferred-packet buffer and the hard bound for both
+// memcpy sites that fill it. One Ogg lacing entry accumulates runs of 255, so
+// segmentLength can legitimately reach 255*255 = 65025 - far past the previous
+// bare 4096 literal, which one of the two copies used without any check at all.
+// 16 KiB covers a worst-case Vorbis packet (an 8192-sample block at the highest
+// practical bitrate is about 12 KiB) and costs nothing in PSRAM.
+// E-VS5: ёмкость буфера отложенного пакета и жёсткая граница для обеих записей
+// в него. Одна запись Ogg lacing суммирует серии по 255, поэтому segmentLength
+// законно доходит до 255*255 = 65025 — намного больше прежнего литерала 4096,
+// в который одна из двух копий писала вообще без проверки.
+// 16 КиБ покрывают худший реальный пакет Vorbis (блок 8192 сэмплов на
+// максимальном практическом битрейте — около 12 КиБ) и ничего не стоят в PSRAM.
+static const uint32_t VORBIS_LAST_SEGMENT_CAPACITY = 16384;
+
 ps_ptr<uint16_t>              s_vorbisSegmentTable;
 ps_ptr<codebook_t>            s_codebooks;
 ps_ptr<ps_ptr<vorbis_info_floor_t>> s_floor_param;
@@ -91,7 +112,7 @@ vector<uint32_t>s_vorbisBlockPicItem;
 
 bool VORBISDecoder_AllocateBuffers(){
     s_vorbisSegmentTable.alloc(256 * sizeof(uint16_t)); s_vorbisSegmentTable.clear();
-    s_lastSegmentTable.alloc(4096);
+    s_lastSegmentTable.alloc(VORBIS_LAST_SEGMENT_CAPACITY);
     VORBISsetDefaults();
     return true;
 }
@@ -108,12 +129,34 @@ void VORBISDecoder_FreeBuffers(){
     if(s_mode_param.valid())        s_mode_param.reset();
     if(s_dsp_state.valid())         s_dsp_state.reset();
 }
+bool VORBISConsumeSetupHeaderFailure(){
+    // One-shot: reading clears it, so a single failure cannot keep re-triggering.
+    // Одноразовый: чтение сбрасывает флаг, поэтому один сбой не триггерит повторно.
+    const bool failed = s_f_vorbisSetupHeaderFailed;
+    s_f_vorbisSetupHeaderFailed = false;
+    return failed;
+}
 void VORBISDecoder_ClearBuffers(){
     bitReader_clear();
     s_lastSegmentTable.clear();
     s_vorbisSegmentTable.clear();
     s_vorbisSegmentTableSize = 0;
-    s_vorbisSegmentTableRdPtr = -1;}
+    s_vorbisSegmentTableRdPtr = -1;
+    // E-VS4: the page-position state has to go with the segment table, otherwise a
+    // realigned parser still carries a stale partial segment and a stale
+    // continued-page flag into the next page and decodes them as audio.
+    // Deliberately NOT cleared here: s_pageNr and the codebook/floor/residue/mapping
+    // tables - keeping them is what lets playback resume on the very next audio page
+    // after a resync, with no gap.
+    // E-VS4: состояние позиции в странице обязано сбрасываться вместе с таблицей
+    // сегментов, иначе выровненный парсер унесёт в следующую страницу устаревший
+    // частичный сегмент и устаревший флаг continued-page и попробует их декодировать.
+    // Намеренно НЕ сбрасываются: s_pageNr и таблицы codebook/floor/residue/mapping —
+    // именно их сохранение позволяет продолжить звук со следующей же аудиостраницы
+    // после resync, без разрыва.
+    s_lastSegmentTableLen = 0;
+    s_f_parseOggDone = false;
+    s_f_oggContinuedPage = false;}
 
 void VORBISsetDefaults(){
     s_pageNr = 0;
@@ -121,6 +164,7 @@ void VORBISsetDefaults(){
     s_f_vorbisNewMetadataBlockPicture = false;
     s_f_lastSegmentTable = false;
     s_f_parseOggDone = false;
+    s_f_vorbisSetupHeaderFailed = false;   // E-VS3
     s_f_oggFirstPage = false;
     s_f_oggContinuedPage = false;
     s_f_oggLastPage = false;
@@ -341,8 +385,46 @@ int32_t vorbisDecodePage3(uint8_t* inbuf, int32_t* bytesLeft, uint32_t segmentLe
         ret = parseVorbisCodebook();
     }
     else {VORBIS_LOG_ERROR("no \"vorbis\" something went wrong, segmentLenght: %i", segmentLength); ret = VORBIS_ERR; }
-    s_pageNr = 4;
-    s_dsp_state = vorbis_dsp_create();
+
+    // E-VS2: the setup header is the only source of the codebook / floor / residue /
+    // mapping / mode tables that the audio path dereferences on every packet. Arming
+    // page 4 after a failed parse is what turned a rejected header into the fu4.2.15
+    // LoadProhibited (info == nullptr inside mapping_inverse): parseVorbisCodebook()
+    // had already returned an error, and it was discarded here.
+    // Byte accounting below stays outside the branch, so the stream keeps advancing
+    // in both cases and no caller can spin on the same bytes.
+    // E-VS2: setup-заголовок — единственный источник таблиц codebook / floor /
+    // residue / mapping / mode, которые аудио-путь разыменовывает на каждом пакете.
+    // Включение page 4 после неудачного разбора и превратило отвергнутый заголовок в
+    // аварию fu4.2.15 (info == nullptr в mapping_inverse): parseVorbisCodebook() уже
+    // вернул ошибку, а её здесь игнорировали.
+    // Учёт байтов ниже намеренно вынесен из ветвления: поток продвигается в обоих
+    // случаях, поэтому зациклиться на одних и тех же байтах нельзя.
+    if(ret >= 0) {
+        s_pageNr = 4;
+        s_dsp_state = vorbis_dsp_create();
+    }
+    else {
+        // Wait for a complete new header chain instead of arming page 4. Leaving
+        // s_pageNr at 3 would not be safe: the "vorbis" probe at the top of
+        // VORBISDecode() raises any value below 4 by one, so the very next segment
+        // would reach page 4 with no codebooks at all - the same crash. From 0 the
+        // decoder can only get back to page 4 through page 1 -> 2 -> 3, and
+        // vorbisDecodePage1() calls clearGlobalConfigurations() on the way, which
+        // releases the half-built tables properly. s_dsp_state is deliberately left
+        // untouched here: page 4 is unreachable until then, and page 1 destroys it
+        // with the s_vorbisChannels value it was created with.
+        // Ждём новую полную цепочку заголовков, а не включаем page 4. Оставить
+        // s_pageNr равным 3 нельзя: проба "vorbis" в начале VORBISDecode() поднимает
+        // любое значение меньше 4 на единицу, и уже следующий сегмент попал бы на
+        // page 4 вообще без кодбуков — та же авария. Из 0 вернуться на page 4 можно
+        // только через page 1 -> 2 -> 3, а vorbisDecodePage1() по дороге вызывает
+        // clearGlobalConfigurations() и корректно освобождает недостроенные таблицы.
+        // s_dsp_state здесь намеренно не трогаем: до этого момента page 4 недостижим,
+        // а page 1 разрушит его с тем же s_vorbisChannels, с которым он создавался.
+        s_pageNr = 0;
+        s_f_vorbisSetupHeaderFailed = true;   // E-VS3: ask the player to re-open the stream
+    }
 
     *bytesLeft -= segmentLength;
     s_vorbisCurrentFilePos += segmentLength;
@@ -359,7 +441,18 @@ int32_t vorbisDecodePage4(uint8_t* inbuf, int32_t* bytesLeft, uint32_t segmentLe
     if(s_f_parseOggDone) { // first loop after VORBISparseOGG()
         if(s_f_oggContinuedPage) {
             if(s_lastSegmentTableLen > 0 || segmentLength > 0) {
-                if(s_lastSegmentTableLen + segmentLength > 1024) {VORBIS_LOG_ERROR("continued page too big, %i", s_lastSegmentTableLen + segmentLength); return VORBIS_ERR;}
+                // E-VS5: was a bare 1024 while the buffer held 4096 - it under-used the
+                // buffer and dropped legitimate large continued packets. Now the bound
+                // is the real capacity, so this path stays safe and stops rejecting
+                // packets it could actually hold.
+                // E-VS5: здесь стоял литерал 1024 при буфере 4096 — он и не использовал
+                // буфер целиком, и терял законные большие continued-пакеты. Теперь
+                // граница равна реальной ёмкости: путь остаётся безопасным и перестаёт
+                // отвергать пакеты, которые на самом деле помещаются.
+                if(s_lastSegmentTableLen + segmentLength > VORBIS_LAST_SEGMENT_CAPACITY) {
+                    VORBIS_LOG_ERROR("continued page too big, %i", s_lastSegmentTableLen + segmentLength);
+                    return VORBIS_ERR;
+                }
                 memcpy(s_lastSegmentTable.get() + s_lastSegmentTableLen, inbuf, segmentLength);
                 bitReader_setData(s_lastSegmentTable.get(), s_lastSegmentTableLen + segmentLength);
                 ret = vorbis_dsp_synthesis(s_lastSegmentTable.get(), s_lastSegmentTableLen + segmentLength, outbuf);
@@ -403,6 +496,20 @@ int32_t vorbisDecodePage4(uint8_t* inbuf, int32_t* bytesLeft, uint32_t segmentLe
         }
         else { // last segment
             if(segmentLength) {
+                // E-VS5: this copy had no bound whatsoever. A packet larger than the
+                // buffer - legitimate on a high-bitrate stream, or fabricated by a
+                // misparsed lacing table after a false OggS - overran the heap and
+                // would surface later as an unrelated crash. Reject the page instead:
+                // the caller resyncs, which costs one packet rather than the heap.
+                // E-VS5: у этой копии не было границы вообще. Пакет больше буфера —
+                // законный на высоком битрейте либо выдуманный битой lacing-таблицей
+                // после ложного OggS — затирал кучу и всплыл бы позже как посторонняя
+                // авария. Теперь страница отвергается: вызывающий делает resync, и это
+                // стоит одного пакета, а не кучи.
+                if(segmentLength > VORBIS_LAST_SEGMENT_CAPACITY) {
+                    VORBIS_LOG_ERROR("last segment too big, %i", segmentLength);
+                    return VORBIS_ERR;
+                }
                 memcpy(s_lastSegmentTable.get(), inbuf, segmentLength);
                 s_lastSegmentTableLen = segmentLength;
                 s_vorbisValidSamples = 0;
@@ -617,7 +724,21 @@ int32_t parseVorbisCodebook(){
     int32_t i;
     int32_t ret = 0;
 
-    s_nrOfCodebooks = bitReader(8) +1;
+    // E-VS1: every count below is read as "value + 1" and then used directly as an
+    // allocation size. bitReader() returns -1 once the packet is exhausted, which
+    // silently turns the count into 0, and alloc(0) hands back a NULL base that the
+    // caller cannot detect (ps_ptr::alloc returns void). Reject the end-of-packet
+    // result here, where it is still an ordinary header error. ONLY the -1 case is
+    // rejected - the existing value range and wrap behaviour stay exactly as before.
+    // E-VS1: каждый счётчик ниже читается как "значение + 1" и сразу идёт размером
+    // выделения. На конце пакета bitReader() возвращает -1, счётчик тихо становится
+    // нулём, а alloc(0) отдаёт NULL, и узнать об этом вызывающий код не может
+    // (ps_ptr::alloc возвращает void). Отсекаем конец пакета здесь, пока это ещё
+    // обычная ошибка заголовка. Отвергается ТОЛЬКО случай -1: диапазон значений и
+    // прежнее поведение при переполнении не меняются.
+    ret = bitReader(8);
+    if(ret < 0) {VORBIS_LOG_ERROR("codebook count past end of setup header"); goto err_out;}
+    s_nrOfCodebooks = ret + 1;
     s_codebooks.alloc(s_nrOfCodebooks * sizeof(codebook_t));
 
     for(i = 0; i < s_nrOfCodebooks; i++){
@@ -636,7 +757,9 @@ int32_t parseVorbisCodebook(){
         }
     }
     /* floor backend settings */
-    s_nrOfFloors  = bitReader(6) + 1;
+    ret = bitReader(6);   // E-VS1
+    if(ret < 0) {VORBIS_LOG_ERROR("floor count past end of setup header"); goto err_out;}
+    s_nrOfFloors  = ret + 1;
     s_floor_param.alloc_array(s_nrOfFloors);
     s_floor_type.alloc(sizeof(int8_t) * s_nrOfFloors);
     for(i = 0; i < s_nrOfFloors; i++) {
@@ -658,7 +781,9 @@ int32_t parseVorbisCodebook(){
     }
 
     /* residue backend settings */
-    s_nrOfResidues = bitReader(6) + 1;
+    ret = bitReader(6);   // E-VS1
+    if(ret < 0) {VORBIS_LOG_ERROR("residue count past end of setup header"); goto err_out;}
+    s_nrOfResidues = ret + 1;
     s_residue_param.alloc(sizeof(vorbis_info_residue_t) * s_nrOfResidues);
     for(i = 0; i < s_nrOfResidues; i++){
          if(res_unpack(s_residue_param.get() + i)){
@@ -668,7 +793,9 @@ int32_t parseVorbisCodebook(){
     }
 
     // /* map backend settings */
-    s_nrOfMaps = bitReader(6) + 1;
+    ret = bitReader(6);   // E-VS1: this is the count that produced the NULL s_map_param
+    if(ret < 0) {VORBIS_LOG_ERROR("mapping count past end of setup header"); goto err_out;}
+    s_nrOfMaps = ret + 1;
     s_map_param.alloc(sizeof(vorbis_info_mapping_t) * s_nrOfMaps);
     for(i = 0; i < s_nrOfMaps; i++) {
         if(bitReader(16) != 0) goto err_out;
@@ -679,7 +806,9 @@ int32_t parseVorbisCodebook(){
     }
 
     /* mode settings */
-    s_nrOfModes = bitReader(6) + 1;
+    ret = bitReader(6);   // E-VS1
+    if(ret < 0) {VORBIS_LOG_ERROR("mode count past end of setup header"); goto err_out;}
+    s_nrOfModes = ret + 1;
     s_mode_param.alloc(sizeof(vorbis_info_mode_t) * s_nrOfModes);
     for(i = 0; i < s_nrOfModes; i++) {
         s_mode_param[i].blockflag = bitReader(1);

@@ -19,6 +19,7 @@
 #include "../adapters/station_list_adapter.h"
 #include "../control_glyph_utf8.h"
 #include "../fonts/lv_fonts.h"
+#include "../font_provider.h"
 #include "../../i18n/i18n.h"
 #include "../profiles/lv_profile_select.h"
 #include "../theme/lv_theme_yoradio.h"
@@ -60,10 +61,8 @@ constexpr lv_coord_t kTapMaxFingerTravelPx  = 24;
 constexpr lv_coord_t kPageSwipeMinTravelPx  = 24;
 static constexpr uint32_t kStationRowSafetyLimit = UINT16_MAX - 10u;
 
-static const void* const kFontStationList =
-    reinterpret_cast<const void*>(&lv_font_yora_montserrat_22_cyr);
-static const void* const kFontCurrentMarker =
-    reinterpret_cast<const void*>(&lv_font_yora_station_icons_22);
+static const void* font_station_list_slot() { return FontProvider::text(22); }
+static const void* font_current_marker() { return FontProvider::icon(22); }
 static const char* const kIconCurrentStation = station_glyph_utf8_volume_2();
 
 static int32_t abs_i32(int32_t v) { return v < 0 ? -v : v; }
@@ -71,11 +70,11 @@ static int32_t abs_i32(int32_t v) { return v < 0 ? -v : v; }
 static int32_t max_i32(int32_t a, int32_t b) { return a > b ? a : b; }
 
 static const lv_font_t* station_list_font() {
-    return &lv_font_yora_montserrat_22_cyr;
+    return FontProvider::text(22);
 }
 
 static const lv_font_t* station_marker_font() {
-    return &lv_font_yora_station_icons_22;
+    return FontProvider::icon(22);
 }
 
 // Shared row metrics: label, overlay, hit-test, and rows_per_page must use the same values.
@@ -359,7 +358,7 @@ static void ensurePageLabel(Instance& instance) {
     instance.lbl_page = lv_label_create(instance.list_area);
     if (!instance.lbl_page) return;
     lv_label_set_long_mode(instance.lbl_page, LV_LABEL_LONG_CLIP);
-    station_set_font(instance.lbl_page, kFontStationList);
+    station_set_font(instance.lbl_page, font_station_list_slot());
     lv_obj_set_style_text_color(instance.lbl_page, yoradio_palette().list_row_text, LV_PART_MAIN);
     lv_obj_set_style_text_line_space(instance.lbl_page, station_line_space(), LV_PART_MAIN);
     lv_obj_set_style_pad_left(instance.lbl_page, list_label_pad_left_for_marker_gutter(), LV_PART_MAIN);
@@ -388,7 +387,7 @@ static void ensureOverlays(Instance& instance) {
             lv_obj_set_width(instance.current_marker, kMarkerBoxW);
             lv_label_set_long_mode(instance.current_marker, LV_LABEL_LONG_CLIP);
             lv_label_set_text(instance.current_marker, kIconCurrentStation);
-            station_set_font(instance.current_marker, kFontCurrentMarker);
+            station_set_font(instance.current_marker, font_current_marker());
             lv_obj_set_style_text_align(instance.current_marker, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
             lv_obj_clear_flag(instance.current_marker, LV_OBJ_FLAG_SCROLLABLE);
             lv_obj_clear_flag(instance.current_marker, LV_OBJ_FLAG_CLICKABLE);
@@ -547,16 +546,19 @@ static void fillCurrentPage(Instance& instance) {
     const uint16_t last = lastStationOnPage(instance);
     const size_t name_limit = name_limit_for_profile();
 
-    size_t used = 0;
-    instance.page_text[0] = '\0';
-    for (uint16_t num = first; num <= last; ++num) {
-        char name_buf[160];
-        if (!station_list_adapter::station_name(num, name_buf, sizeof(name_buf))) {
-            format_fallback_station_name(name_buf, sizeof(name_buf), num);
-        }
-        truncate_utf8_in_place(name_buf, name_limit);
-        if (!append_station_line(instance.page_text, instance.page_text_cap, used, num, name_buf)) {
-            break;
+    if (!station_list_adapter::station_page_text(
+            first, last, instance.page_text, instance.page_text_cap, name_limit)) {
+        size_t used = 0;
+        instance.page_text[0] = '\0';
+        for (uint16_t num = first; num <= last; ++num) {
+            char name_buf[160];
+            if (!station_list_adapter::station_name(num, name_buf, sizeof(name_buf))) {
+                format_fallback_station_name(name_buf, sizeof(name_buf), num);
+            }
+            truncate_utf8_in_place(name_buf, name_limit);
+            if (!append_station_line(instance.page_text, instance.page_text_cap, used, num, name_buf)) {
+                break;
+            }
         }
     }
 
@@ -818,6 +820,7 @@ void populate(Instance& instance) {
     setPageIndexFromCurrentStation(instance);
     fillCurrentPage(instance);
     cacheListSignature(instance);
+    instance.page_filled_for_pending_enter = true;
 }
 
 RefreshOnActivateResult refreshOnActivate(Instance& instance) {
@@ -837,7 +840,14 @@ RefreshOnActivateResult refreshOnActivate(Instance& instance) {
 
 void onEnter(Instance& instance) {
     if (!instance.list_area) return;
+    const bool already_filled = instance.page_filled_for_pending_enter;
+    instance.page_filled_for_pending_enter = false;
+    const uint16_t filled_page = instance.page_index;
     setPageIndexFromCurrentStation(instance);
+    if (already_filled && instance.page_index == filled_page) {
+        layoutCurrentMarker(instance, station_list_adapter::current_station_num());
+        return;
+    }
     fillCurrentPage(instance);
 }
 
@@ -874,6 +884,7 @@ void releaseAfterTreeDelete(Instance& instance) {
     instance.station_total = 0;
     instance.focus_station_num = 0;
     instance.list_sig_cache_valid = false;
+    instance.page_filled_for_pending_enter = false;
     resetInputState(instance);
     releasePageTextBuffer(instance);
 }

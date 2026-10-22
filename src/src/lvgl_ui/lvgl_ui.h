@@ -18,6 +18,11 @@ typedef struct _lv_obj_t lv_obj_t;
 
 namespace lvgl_ui {
 
+// Declared in theme/lv_theme_yoradio.h; forward-declared here so this lightweight header
+// does not have to pull in lvgl.h just for the enum.
+// Объявлен в theme/lv_theme_yoradio.h; forward-declaration, чтобы не тянуть lvgl.h.
+enum class ThemePreset : uint8_t;
+
 class ILvglScreen;
 
 // Stage 0: compile-time check that LVGL is linked
@@ -32,9 +37,15 @@ void initRuntime();
 // Stage 2: инициализация источника тиков LVGL (esp_timer + lv_tick_inc())
 void initTick();
 
-// Stage 2: register LVGL display driver that renders into Arduino_Canvas.
-// Stage 2: регистрация LVGL-дисплея, рисующего в Arduino_Canvas
+// Register the LVGL display driver for the current DisplayPort -> direct esp_lcd path.
+// Регистрация LVGL-дисплея для текущего пути DisplayPort -> direct esp_lcd.
 void initDisplayDriver(uint16_t hor_res, uint16_t ver_res);
+
+// Apply persisted/runtime Performance monitor ON/OFF (DspTask or LVGL init window).
+// Uses explicit s_disp; no-op until the display exists. Sole sysmon show/hide/pause/resume seam.
+// Применить ON/OFF оверлея производительности (DspTask или init-окно LVGL).
+// Явный s_disp; no-op до создания дисплея. Единственный шов show/hide/pause/resume.
+void applyPerformanceMonitorState(bool enabled);
 
 // Stage 5.2: register pointer indev after display driver (read_cb on DspTask only).
 // Этап 5.2: pointer indev после дисплея (read_cb только на DspTask).
@@ -79,19 +90,52 @@ void refreshSettingsScreen();
 // force_full_redraw: инвалидация всего экрана + немедленный flush — нужно после смены ориентации.
 void refreshMainScreenFromSettings(bool force_full_redraw = false);
 
-// Stage 6.1F-d: WebUI committed /bg/main_*.bin — reload Main PSRAM bg if slot matches active preset (DspTask queue only).
-// После upload_bg: перечитать фон в PSRAM только для активного слота темы; только из обработчика displayQueue.
+// Repair A2: invalidate + lv_refr_now of lv_scr_act() (DspTask). No page navigation.
+// Returns false if the display driver / active screen is not ready (caller still resyncs).
+// Repair A2: инвалидация + немедленный flush текущего экрана. Без смены страницы.
+bool tryRedrawActiveScreenNow();
+
+// Repair E / Slice 6C: coalesced post-dispatch RGB recovery (DspTask only).
+// Marks that DspTask owes redraw + RGB resync after queued display/LVGL/asset work is quiescent.
+// Multiple marks collapse to one final recovery. Do not call requestRgbResync/lv_refr_now
+// from LVGL event callbacks for these episodes.
+// Repair E / слайс 6C: схлопнутый RGB recovery после dispatch (только DspTask).
+// Долг: стабильный кадр + resync, когда текущая пачка display/LVGL/asset-работы успокоилась.
+// Несколько меток → одно финальное восстановление. Не звать restart/lv_refr_now из LVGL callback.
+void requestRuntimeRgbRecovery();
+
+// Slice 6C: this DspTask iteration still has relevant display/asset work (queue / page create /
+// JPEG apply). If runtime recovery is pending, keep it armed and do not consume until idle.
+// Слайс 6C: в этой итерации ещё есть display/asset-работа. Pending recovery не потреблять.
+void noteDisplayBatchBusy();
+
+// WebUI committed /bg/user_*.jpg — reload Main JPEG cache if slot matches active preset (DspTask queue only).
+// После upload_bg: перечитать JPEG-фон только для активного слота темы; только из обработчика displayQueue.
 void onMainBackgroundSlotCommitted(uint8_t slot);
 
 // Station Art MVP: WebUI committed /logo/<key>.bin (upload or remove) — force art reload on Main (DspTask queue only).
 // Station Art MVP: после upload_art / remove_art — принудительно перезагрузить арт на Main (только DspTask).
 void onStationArtCommitted();
 
-// Stage 6.6R-B: apply runtime theme preset change (DspTask queue handler only).
+// Stage 6.6R-B / S6-THEME-01: request a runtime theme preset change (DspTask only).
+// Cheap: records the selection and returns. The heavy LVGL transaction runs later on a
+// quiet taskHandler() iteration, and a rapid burst collapses to one apply (latest wins).
 // preset_id: 0=Dark 1=Light 2=Custom (matches ThemePreset enum value).
 // Never call LVGL APIs from NetServer/WebUI — enqueue SET_THEME_PRESET instead.
-// Этап 6.6R-B: применить смену пресета темы. Только из обработчика очереди DspTask.
+// Этап 6.6R-B / S6-THEME-01: запросить смену пресета темы. Только DspTask.
+// Дешёвая операция: запомнить выбор и выйти. Тяжёлая транзакция — позже, на спокойной
+// итерации taskHandler(); быстрая серия схлопывается в одно применение (побеждает последний).
 void onThemePresetChanged(uint8_t preset_id);
+
+// S6-THEME-01: the preset the user has most recently *requested* (may still be pending).
+// UI that must follow the user's intent immediately (Settings row label, preset cycling)
+// reads this; everything that needs the preset actually in effect keeps using
+// yoradio_theme_active_preset().
+// S6-THEME-01: последний *запрошенный* пресет (применение может быть ещё отложено).
+// UI, обязанный сразу отражать намерение пользователя (метка и цикл в Settings), читает это;
+// всё, что нуждается в фактически действующем пресете, продолжает использовать
+// yoradio_theme_active_preset().
+ThemePreset themeRequestedPreset();
 
 // Stage 6.6R-F1: reload /data/theme_custom.txt into runtime Custom palette (DspTask only).
 // Live LVGL reinit only when active preset is Custom; does not change theme.dat.
@@ -113,9 +157,16 @@ void dismissBootForMainHandoff();
 // Wi‑Fi 5B: Boot fail → Wi‑Fi Recovery — tear down Boot into RebootRequired without Main create/enter (no BG preload).
 // Wi‑Fi 5B: снять Boot сразу в Wi‑Fi shell, без Main/preload.
 void dismissBootForWifiRecoveryHandoff();
-// Main path: dismiss only after min time on screen (non-blocking; see Display::_tryCompleteLvglPlayerHandoff).
-// Main: снять Boot не раньше min времени на экране (без блокировки DspTask).
+// Main path: dismiss after active-theme JPEG prepare (brief Loading text, not extra 3s dwell).
+// Main: снять Boot после prepare JPEG (короткий Loading, без лишних 3 с).
 bool dismissBootForMainHandoffWhenDue();
+// Active-theme JPEG cache during Boot (DspTask). Hides first-Main decode delay.
+// Кэш JPEG активной темы на Boot (DspTask). Убирает паузу первого Main.
+void bootPrepareActiveMainBackgroundIfNeeded();
+bool mainBgBootPrepareDone();
+// DspTask: apply a finished runtime JPEG job to Main if one is ready.
+// DspTask: если runtime JPEG job готов — применить к Main.
+void mainBgPollRuntimeApply();
 // Wi‑Fi 5A: min Boot dwell elapsed (same threshold as dismissBootWhenDue).
 bool isLvglBootMinDwellElapsed();
 

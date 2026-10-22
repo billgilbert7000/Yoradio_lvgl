@@ -18,10 +18,12 @@
 
 #include "lvgl.h"
 #include "../../core/config.h"
+#include "../../core/display.h"
 #include "../../i18n/i18n.h"
 #include "../adapters/preset_store.h"
 #include "../adapters/station_list_adapter.h"
 #include "../fonts/lv_fonts.h"
+#include "../font_provider.h"
 #include "../lvgl_ui.h"
 #include "../profiles/lv_profile_select.h"
 #include "../theme/lv_theme_yoradio.h"
@@ -54,20 +56,16 @@ static constexpr char kBulletPrefixUtf8[] =
 
 // ── Font resources / Ресурсы шрифтов ─────────────────────────────────────────
 
-static const lv_font_t* const kFontTitle =
-    &lv_font_yora_montserrat_20_cyr;
+static const lv_font_t* font_title() { return FontProvider::text(20); }
 
-static const lv_font_t* const kFontSlotNumber =
-    &lv_font_yora_montserrat_16_cyr;  // M16 — accepted slot index size (post-6.4 polish)
+static const lv_font_t* font_slot_number() { return FontProvider::text(16); }
 
-static const lv_font_t* const kFontStationName =
-    &lv_font_yora_montserrat_22_cyr;
+static const lv_font_t* font_station_name() { return FontProvider::text(22); }
 
-static const lv_font_t* const kFontFooter =
-    &lv_font_yora_montserrat_14_cyr;
+static const lv_font_t* font_footer() { return FontProvider::text(14); }
 
 static const lv_font_t* preset_station_number_font() {
-    return static_cast<const lv_font_t*>(LV_ACTIVE_PROFILE.font_normal);
+    return FontProvider::text(LV_ACTIVE_PROFILE.font_normal_px);
 }
 
 // ── Timing constants / Тайминги ───────────────────────────────────────────────
@@ -180,7 +178,7 @@ void LvglPresetScreen::create_title(LvglPresetScreen& self, const YoRadioPalette
     lv_label_set_text(self._title, i18n::text(i18n::TextId::PresetTitle));
     lv_obj_set_style_text_color(self._title, pal.text_primary, LV_PART_MAIN);
     lv_obj_set_style_text_align(self._title, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_set_style_text_font(self._title, kFontTitle, LV_PART_MAIN);
+    lv_obj_set_style_text_font(self._title, font_title(), LV_PART_MAIN);
     lv_obj_clear_flag(self._title, LV_OBJ_FLAG_CLICKABLE);
 }
 
@@ -220,7 +218,7 @@ void LvglPresetScreen::create_preset_row(LvglPresetScreen& self, uint8_t slot, c
         lv_label_set_text(self._slot_labels[slot], buf);
         lv_obj_set_style_text_color(self._slot_labels[slot], pal.text_secondary, LV_PART_MAIN);
         lv_obj_set_style_text_align(self._slot_labels[slot], LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-        lv_obj_set_style_text_font(self._slot_labels[slot], kFontSlotNumber, LV_PART_MAIN);
+        lv_obj_set_style_text_font(self._slot_labels[slot], font_slot_number(), LV_PART_MAIN);
         lv_obj_clear_flag(self._slot_labels[slot], LV_OBJ_FLAG_CLICKABLE);
     }
 
@@ -249,13 +247,13 @@ void LvglPresetScreen::create_preset_row(LvglPresetScreen& self, uint8_t slot, c
 
     self._name_labels[slot] = lv_label_create(self._rows[slot]);
     if (self._name_labels[slot]) {
-        const lv_coord_t name_line_h = lv_font_get_line_height(kFontStationName);
+        const lv_coord_t name_line_h = lv_font_get_line_height(font_station_name());
         lv_obj_set_width(self._name_labels[slot], kNameFlexBaseWidth);
         lv_obj_set_flex_grow(self._name_labels[slot], 1);
         lv_obj_set_height(self._name_labels[slot], name_line_h);
         lv_label_set_long_mode(self._name_labels[slot], LV_LABEL_LONG_DOT);
         lv_label_set_text(self._name_labels[slot], kStrEmptyText);
-        lv_obj_set_style_text_font(self._name_labels[slot], kFontStationName, LV_PART_MAIN);
+        lv_obj_set_style_text_font(self._name_labels[slot], font_station_name(), LV_PART_MAIN);
         lv_obj_clear_flag(self._name_labels[slot], LV_OBJ_FLAG_CLICKABLE);
     }
 }
@@ -293,7 +291,7 @@ void LvglPresetScreen::create_footer(LvglPresetScreen& self, const YoRadioPalett
     lv_label_set_text(self._helper, helper);
     lv_obj_set_style_text_color(self._helper, pal.text_secondary, LV_PART_MAIN);
     lv_obj_set_style_text_align(self._helper, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_set_style_text_font(self._helper, kFontFooter, LV_PART_MAIN);
+    lv_obj_set_style_text_font(self._helper, font_footer(), LV_PART_MAIN);
     wgt_footer_pill::make_child_passive(self._helper);
     lv_obj_clear_flag(self._helper, LV_OBJ_FLAG_SCROLLABLE);
 }
@@ -330,6 +328,14 @@ void LvglPresetScreen::enter() {
     _lastCountdownSecond = -1;
     _cancelFeedbackTimer();
     (void)preset_store::begin();
+    // First entry may commit or discard an orphan temp file left by an interrupted save.
+    // RGB recovery is owed only when LittleFS was actually mutated; Repair E consumes it after
+    // dispatch (enter() can run from poll_top_edge_swipe after lv_timer_handler — still DspTask).
+    // Первый вход может закоммитить или удалить осиротевший временный файл прошлого сохранения.
+    // Recovery только при реальной мутации LittleFS; Repair E снимает долг после dispatch.
+    if (preset_store::consumeStorageMutation()) {
+        requestRuntimeRgbRecovery();
+    }
     _setHelperDefault();
     _startCountdownTimer();
     for (uint8_t s = 0; s < kSlotCount; ++s) _updateRowContent(s);
@@ -520,7 +526,7 @@ void LvglPresetScreen::_cancelFeedbackTimer() {
 
 void LvglPresetScreen::_feedbackTimerCb(lv_timer_t* timer) {
     if (!timer) return;
-    auto* self = static_cast<LvglPresetScreen*>(timer->user_data);
+    auto* self = static_cast<LvglPresetScreen*>(lv_timer_get_user_data(timer));
     if (!self) return;
     self->_feedback_timer = nullptr;
     self->_setHelperDefault();
@@ -546,7 +552,7 @@ void LvglPresetScreen::_startCountdownTimer() {
 
 void LvglPresetScreen::_countdownTimerCb(lv_timer_t* timer) {
     if (!timer) return;
-    auto* self = static_cast<LvglPresetScreen*>(timer->user_data);
+    auto* self = static_cast<LvglPresetScreen*>(lv_timer_get_user_data(timer));
     if (!self || self->_feedbackActive) return;
     self->_updateCountdownHelper();
 }
@@ -573,7 +579,17 @@ void LvglPresetScreen::_onRowLongPressed(uint8_t slot) {
     _long_press_handled = true;
     refreshActiveTemporaryTimeout();
 
-    if (preset_store::saveCurrentStation(slot)) {
+    const bool saved = preset_store::saveCurrentStation(slot);
+    // DEVICE-PROVEN hazard: the temp/verify/rename save transaction desyncs RGB scanout on this
+    // panel despite writing only 26 bytes. Repair E: mark recovery here, do not restart inside
+    // this LVGL callback — taskHandler redraws then requestRgbResync after dispatch.
+    // DEVICE-PROVEN: транзакция tmp/verify/rename рассинхронизирует RGB scanout на этой панели
+    // несмотря на 26 байт. Recovery помечается здесь, restart не из callback — после dispatch.
+    if (preset_store::consumeStorageMutation()) {
+        requestRuntimeRgbRecovery();
+    }
+
+    if (saved) {
         _updateRowContent(slot);
         char msg[kSavedMessageBufferSize];
         preset_format_checked(msg, sizeof(msg), "",

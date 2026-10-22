@@ -6,7 +6,9 @@
 #include "player.h"
 #include "network.h"
 #include "netserver.h"
+#include "../audioI2S/audio_text_url_utils.h"
 #include "../ai/ai_log.h"  // AI Layer logging macros
+#include "../i18n/i18n.h"
 #ifdef USE_SD
 #include "sdmanager.h"
 #endif
@@ -52,6 +54,9 @@ static bool fsEnsureRequiredDirectories() {
   }
   if (!fsEnsureDirectory("/logo", false)) {
     Serial.println("[FS] warning: /logo not created");
+  }
+  if (!fsEnsureDirectory("/fonts", false)) {
+    Serial.println("[FS] warning: /fonts not created");
   }
   return ok;
 }
@@ -220,7 +225,13 @@ bool aiSaveToFS(const AIConfig& cfg) {
   // Update runtime cache after successful save / Обновляем runtime кеш после успешного сохранения
   g_ai_cfg = cfg;
   g_ai_cfg_loaded = true;
-  
+
+  // AI Layer Apply persistence is complete. One resync for the whole transaction; the later
+  // debounced NVS tail is ordinary small persistence and is deliberately not covered here.
+  // Persistence AI Layer Apply завершена. Один ресинхрон на всю транзакцию; последующий
+  // отложенный NVS-хвост — обычная мелкая запись, здесь намеренно не покрывается.
+  display.requestRgbResync();
+
   return true;
 }
 
@@ -261,8 +272,7 @@ void aiPerformDeferredClearIfNeeded() {
 }
 
 void u8fix(char *src){
-  char last = src[strlen(src)-1]; 
-  if ((uint8_t)last >= 0xC2) src[strlen(src)-1]='\0';
+  audio_safe::truncateAtInvalidUtf8(src);
 }
 
 bool Config::_isFSempty() {
@@ -457,6 +467,42 @@ void Config::_setupVersion(){
       break;
     case 7:
       saveValue(&store.sleep_timer_action, static_cast<uint8_t>(0));
+      break;
+    case 8:
+      saveValue(&store.performance_monitor, false);
+      break;
+    case 9:
+      // FU6-A: the Ai tail grew by 3 bytes. sm::v2::loadSection() zero-fills the new tail on the
+      // first boot after the update, so seed the real defaults here.
+      // FU6-A: хвост Ai вырос на 3 байта; loadSection() обнуляет новый хвост — задаём значения.
+      saveValue(&store.text_scroll_speed, static_cast<uint8_t>(40));
+      saveValue(&store.text_scroll_type, static_cast<uint8_t>(1));   // Circular
+      saveValue(&store.text_scroll_delay_s, static_cast<uint8_t>(5));
+      break;
+    case 10:
+      // Ai tail grew again by 2 bytes (deep_sleep_wake_after_minutes). Same zero-fill-then-seed
+      // contract as case 9: loadSection() zero-fills the new tail, so seed the real default here.
+      // Хвост Ai снова вырос на 2 байта; тот же контракт, что и в case 9 — задаём default здесь.
+      saveValue(&store.deep_sleep_wake_after_minutes, static_cast<uint16_t>(0));
+      break;
+    case 11:
+      // TIMERS extends the Ai tail by three new uint16_t presets. The preceding renamed wake
+      // field keeps its exact offset and value; seed only bytes that did not exist in v11.
+      // TIMERS добавляет три uint16_t в хвост Ai. Переименованный wake сохраняет offset/value;
+      // обнуляем только действительно новые поля.
+      saveValue(&store.radio_stop_after_minutes, static_cast<uint16_t>(0));
+      saveValue(&store.radio_start_after_minutes, static_cast<uint16_t>(0));
+      saveValue(&store.deep_sleep_after_minutes, static_cast<uint16_t>(0));
+      break;
+    case 12:
+      // Existing installations used duration > 0 as the enabled state. New bytes were appended
+      // to the Ai tail, so migrate that intent without changing any stored interval.
+      // Раньше enabled означал duration > 0; сохраняем это намерение без изменения интервалов.
+      saveValue(&store.radio_stop_timer_enabled, store.radio_stop_after_minutes > 0);
+      saveValue(&store.radio_start_timer_enabled, store.radio_start_after_minutes > 0);
+      saveValue(&store.deep_sleep_timer_enabled, store.deep_sleep_after_minutes > 0);
+      saveValue(&store.deep_sleep_wake_timer_enabled,
+                store.deep_sleep_wake_after_minutes > 0);
       break;
     default:
       break;
@@ -698,6 +744,19 @@ void Config::setDefaults() {
   store.autodim_timeout_sec = 60;
   store.autodim_level = 20;
   store.sleep_timer_action = 0;
+  store.performance_monitor = false;
+  // FU6-A text scrolling: fresh-device defaults / значения по умолчанию для нового устройства
+  store.text_scroll_speed = 40;    // px/s — LVGL's own nominal default
+  store.text_scroll_type = 1;      // text_scroll::Mode::Circular — the only mode shipped pre-FU6
+  store.text_scroll_delay_s = 5;   // s — matches legacy YoRadio startscrolldelay = 5000 ms
+  store.deep_sleep_wake_after_minutes = 0;  // RTC wake-after timer disabled by default
+  store.radio_stop_after_minutes = 0;
+  store.radio_start_after_minutes = 0;
+  store.deep_sleep_after_minutes = 0;
+  store.radio_stop_timer_enabled = false;
+  store.radio_start_timer_enabled = false;
+  store.deep_sleep_timer_enabled = false;
+  store.deep_sleep_wake_timer_enabled = false;
 
   // AI settings migrated to FS /ai.json and runtime cache (see aiGetRuntimeConfig())
   // Runtime config will be applied in Config::init() after store is loaded
@@ -770,9 +829,14 @@ uint8_t Config::setLastSSID(uint8_t val) {
 }
 
 void Config::setTitle(const char* title) {
+  // Validate into a temporary buffer before clearing state; empty is an intentional value.
+  // Сначала проверяем во временный буфер; пустая строка остаётся намеренным значением.
+  char clean[BUFLEN] = {0};
+  if(!audio_safe::copyMetadataUtf8(clean, sizeof(clean), title)) return;
+
   vuThreshold = 0;
   memset(config.station.title, 0, BUFLEN);
-  strlcpy(config.station.title, title, BUFLEN);
+  strlcpy(config.station.title, clean, BUFLEN);
   u8fix(config.station.title);
   netserver.requestOnChange(TITLE, 0);
   // 8.1HX-B: drop re-entrant netserver.loop() drain — main loop() drains nsQueue.
@@ -780,10 +844,35 @@ void Config::setTitle(const char* title) {
   display.putRequest(NEWTITLE);
 }
 
+bool isTransientPlaybackTitle(const char* title) {
+  if (!title || title[0] == '\0') return false;
+  // Legacy EN/RU sentinels kept byte-identical to the former audiohandlers checks.
+  // Исторические EN/RU маркеры — байт-в-байт как прежние проверки в audiohandlers.
+  if (strstr(title, "timeout") != nullptr) return true;
+  if (strstr(title, "[соединение]") != nullptr) return true;
+  if (strstr(title, "[connecting]") != nullptr) return true;
+  if (strstr(title, "(connection)") != nullptr) return true;
+  if (strstr(title, "[ready]") != nullptr) return true;
+  if (strstr(title, "[готов]") != nullptr) return true;
+  if (strstr(title, "[stopped]") != nullptr) return true;
+  if (strstr(title, "[остановлено]") != nullptr) return true;
+  // Current compile-time locale pack (covers PL/SK placeholders absent from the legacy list).
+  // Текущий i18n-пакет (PL/SK плейсхолдеры, которых нет в legacy-списке).
+  if (strcmp(title, i18n::text(i18n::TextId::PlayerConnecting)) == 0) return true;
+  if (strcmp(title, i18n::text(i18n::TextId::PlayerReady)) == 0) return true;
+  if (strcmp(title, i18n::text(i18n::TextId::PlayerStopped)) == 0) return true;
+  return false;
+}
+
 void Config::setStation(const char* station) {
+  // A rejected/null input must not erase the previous station name (alias-safe as well).
+  // Rejected/null input не должен стирать прежнее имя станции; alias также безопасен.
+  char clean[BUFLEN] = {0};
+  if(!audio_safe::copyMetadataUtf8(clean, sizeof(clean), station)) return;
+
   memset(config.station.name, 0, BUFLEN);
-  strlcpy(config.station.name, station, BUFLEN);
-  u8fix(config.station.title);
+  strlcpy(config.station.name, clean, BUFLEN);
+  u8fix(config.station.name);
 }
 
 void Config::indexPlaylist() {
@@ -1084,31 +1173,6 @@ void Config::setDspOn(bool dspon, bool saveval){
   }
 }
 
-void Config::doSleep(){
-  if(BRIGHTNESS_PIN!=255) analogWrite(BRIGHTNESS_PIN, 0);
-  display.deepsleep();
-#if !defined(ARDUINO_ESP32C3_DEV)
-  if(WAKE_PIN!=255) esp_sleep_enable_ext0_wakeup((gpio_num_t)WAKE_PIN, LOW);
-  esp_sleep_enable_timer_wakeup(config.sleepfor * 60 * 1000000ULL);
-  esp_deep_sleep_start();
-#endif
-}
-
-void Config::doSleepW(){
-  if(BRIGHTNESS_PIN!=255) analogWrite(BRIGHTNESS_PIN, 0);
-  display.deepsleep();
-#if !defined(ARDUINO_ESP32C3_DEV)
-  if(WAKE_PIN!=255) esp_sleep_enable_ext0_wakeup((gpio_num_t)WAKE_PIN, LOW);
-  esp_deep_sleep_start();
-#endif
-}
-
-void Config::sleepForAfter(uint16_t sf, uint16_t sa){
-  sleepfor = sf;
-  if(sa > 0) _sleepTimer.attach(sa * 60, doSleep);
-  else doSleep();
-}
-
 void Config::bootInfo() {
   BOOTLOG("************************************************");
   BOOTLOG("*               ёRadio v%s             *", YOVERSION);
@@ -1123,6 +1187,8 @@ void Config::bootInfo() {
   }
   BOOTLOG("chip:\t\tmodel: %s | rev: %d | id: %d | cores: %d | psram: %d", ESP.getChipModel(), ESP.getChipRevision(), chipId, ESP.getChipCores(), ESP.getPsramSize());
   BOOTLOG("display:\tmodel: %d (CS-%d, DC-%d, RST-%d, SPI-%s)", DSP_MODEL, TFT_CS, TFT_DC, TFT_RST, DSP_HSPI?"HSPI":"VSPI");
+  BOOTLOG("RGB bounce:\t%s", YORADIO_RGB_BOUNCE10 ? "B10" : "OFF");
+  BOOTLOG("DspTask stack:\t%d", YORADIO_DSPTASK_12K ? 12288 : 10240);
 //  BOOTLOG("display:\tmodel: %d, (CS-%d, DC-%d, RST-%d, SPI-%s, MOSI-%d, SCLK-%d)", DSP_MODEL, TFT_CS, TFT_DC, TFT_RST, DSP_HSPI?"HSPI":"VSPI", mosi_pin, sck_pin);
   if(VS1053_CS==255) {
     BOOTLOG("audio:\t\t%s (DOUT-%d, BCLK-%d, LRC-%d)", "I2S", I2S_DOUT, I2S_BCLK, I2S_LRC);

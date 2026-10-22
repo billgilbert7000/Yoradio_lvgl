@@ -5,60 +5,17 @@
 #include "Arduino.h"
 #include "../core/config.h"
 #include "../core/autodim.h"
-#include "../core/options.h"   // pulls myoptions.h → YORADIO_WEATHER_UI_DIAG
+#include "../core/options.h"
+#include "lvgl_ui.h"
 
 // W2D: gated page-transition diagnostics (carousel mem/object pressure investigation).
-// Default OFF; enable via YORADIO_WEATHER_UI_DIAG=1 in myoptions.h (local, not committed).
 // W2D: gated диагностика переходов карусели; по умолчанию выкл.
-#ifndef YORADIO_WEATHER_UI_DIAG
-#define YORADIO_WEATHER_UI_DIAG 0
-#endif
 
-#if YORADIO_WEATHER_UI_DIAG
-#include <esp_heap_caps.h>
-#endif
 
 namespace lvgl_ui {
 
 namespace {
 
-#if YORADIO_WEATHER_UI_DIAG
-const char* pageName(int index) {
-    switch (index) {
-        case PageChain::INFO_INDEX:     return "Info";
-        case PageChain::MAIN_INDEX:     return "Main";
-        case PageChain::VISUAL_INDEX:   return "Visual";
-        case PageChain::STATION_INDEX:  return "Station";
-        case PageChain::WEATHER_INDEX:  return "Weather";
-        case PageChain::SETTINGS_INDEX: return "Settings";
-        default:                        return "?";
-    }
-}
-
-uint32_t diagCountObjs(lv_obj_t* root) {
-    if (!root) return 0;
-    uint32_t n = 1;
-    const uint32_t c = lv_obj_get_child_cnt(root);
-    for (uint32_t i = 0; i < c; ++i) n += diagCountObjs(lv_obj_get_child(root, i));
-    return n;
-}
-
-// LVGL pool monitor (gradients alloc here: LV_MEM_SIZE 48K, LV_GRAD_CACHE_DEF_SIZE 0) + heaps.
-// Монитор пула LVGL (тут аллоцируются градиенты) + кучи.
-void diagDump(const char* tag, int idx, lv_obj_t* root) {
-    lv_mem_monitor_t mon;
-    lv_mem_monitor(&mon);
-    Serial.printf("[WX_UI_DIAG] %s page=%s(%d) objs=%lu | lvpool free=%lu biggest=%lu "
-                  "used=%u%% frag=%u%% | int_free=%u int_big=%u psram_free=%u psram_big=%u\n",
-                  tag, pageName(idx), idx, (unsigned long)diagCountObjs(root),
-                  (unsigned long)mon.free_size, (unsigned long)mon.free_biggest_size,
-                  (unsigned)mon.used_pct, (unsigned)mon.frag_pct,
-                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-}
-#endif // YORADIO_WEATHER_UI_DIAG
 
 constexpr uint32_t kPageAnimMs = 300;
 // Boot → Main only (dismissBoot); carousel goTo uses policy below when animation enabled.
@@ -83,6 +40,14 @@ void loadScreenAnimAutoDel(lv_obj_t* scr, lv_scr_load_anim_t anim, uint32_t time
 }
 
 } // namespace
+
+// Slice 6C: create/enter may LittleFS-read into PSRAM after an earlier one-shot recovery
+// already consumed its pending flag. Re-arm Stage-5 recovery and keep this iteration busy.
+// Слайс 6C: create/enter может читать LittleFS после уже потреблённого recovery — перевзводим Stage-5.
+static void afterPageAssetWork() {
+    requestRuntimeRgbRecovery();
+    noteDisplayBatchBusy();
+}
 
 void PageChain::registerPage(int index, ILvglScreen* page) {
     if (index < 0 || index >= PAGE_COUNT) return;
@@ -113,6 +78,37 @@ int PageChain::findPrevPageIndex(int from) const {
 
 bool PageChain::navigationBlocked() const {
     return _special != SpecialMode::None;
+}
+
+void PageChain::armRgbResyncOnTransitionComplete(lv_obj_t* destination) {
+    if (!destination || destination == lv_scr_act()) return;
+
+    // One completion callback per destination. Boot handoff can immediately route through
+    // goTo(Main) as well; replacing the earlier arm prevents two requests for that one load.
+    // Один callback на destination. Boot handoff может сразу пройти и через goTo(Main),
+    // поэтому повторный arm заменяет прежний и не создаёт второй запрос.
+    lv_obj_remove_event_cb_with_user_data(
+        destination, transitionScreenLoadedEvent, this);
+    lv_obj_add_event_cb(
+        destination, transitionScreenLoadedEvent, LV_EVENT_SCREEN_LOADED, this);
+}
+
+void PageChain::transitionScreenLoadedEvent(lv_event_t* e) {
+    if (!e || lv_event_get_code(e) != LV_EVENT_SCREEN_LOADED) return;
+
+    auto* self = static_cast<PageChain*>(lv_event_get_user_data(e));
+    auto* destination = static_cast<lv_obj_t*>(lv_event_get_target(e));
+    if (!self || !destination) return;
+
+    lv_obj_remove_event_cb_with_user_data(
+        destination, transitionScreenLoadedEvent, self);
+    self->_completedTransitionRgbResyncPending = true;
+}
+
+bool PageChain::takeCompletedTransitionRgbResyncRequest() {
+    const bool pending = _completedTransitionRgbResyncPending;
+    _completedTransitionRgbResyncPending = false;
+    return pending;
 }
 
 ILvglScreen* PageChain::activeScreen() const {
@@ -199,10 +195,6 @@ void PageChain::goTo(int index) {
         ? LV_SCR_LOAD_ANIM_MOVE_LEFT
         : LV_SCR_LOAD_ANIM_MOVE_RIGHT;
 
-#if YORADIO_WEATHER_UI_DIAG
-    // Before transition: previous page still active (e.g. before entering Weather/Main).
-    diagDump("goTo_before", _currentIndex, prev ? prev->screen() : nullptr);
-#endif
 
     // Create the next screen while prev is still the active LVGL screen (peak = old + new trees).
     // Создаём следующий экран, пока prev ещё активен (пик памяти = старое + новое дерево).
@@ -210,14 +202,13 @@ void PageChain::goTo(int index) {
     next->create();
     next->enter();
     _currentIndex = index;
+    afterPageAssetWork();
 
-#if YORADIO_WEATHER_UI_DIAG
-    // After next->create()/enter(): destination objects exist (e.g. after Weather create).
-    diagDump("goTo_after_create", index, next->screen());
-#endif
 
     lv_obj_t* next_scr = next->screen();
     if (!next_scr) return; // create() failed (e.g. LVGL pool exhausted) — guard clears the flag.
+
+    armRgbResyncOnTransitionComplete(next_scr);
 
     // W2F unified auto-delete: prev is deleted by LVGL on load, so its object tree returns to the
     // 48 KB pool before the next page redraws (e.g. Main gradients). No per-page non-resident flag.
@@ -239,19 +230,12 @@ void PageChain::goTo(int index) {
         prev->prepareForAutoDelete();
         loadScreenAnimAutoDel(next_scr, LV_SCR_LOAD_ANIM_NONE, 0);
         prev->releaseAfterAutoDelete();
-#if YORADIO_WEATHER_UI_DIAG
-        diagDump("goTo_after_auto_delete", index, next_scr);
-#endif
     } else {
         // First load (no prev) or prev already == next_scr — just load, nothing to auto-delete.
         // Первая загрузка (нет prev) или prev уже == next_scr — просто грузим.
         lv_scr_load(next_scr);
     }
 
-#if YORADIO_WEATHER_UI_DIAG
-    // After load: destination is the active LVGL screen (e.g. after Main becomes active).
-    diagDump("goTo_after_load", index, next_scr);
-#endif
     autodim_notify_activity("navigation");
 }
 
@@ -273,7 +257,9 @@ void PageChain::showTemporary(ILvglScreen* scr, uint32_t timeout_ms) {
 
     scr->create();
     scr->enter();
-    loadScreenAnim(scr->screen(), LV_SCR_LOAD_ANIM_MOVE_BOTTOM, kPageAnimMs);
+    lv_obj_t* temp_scr = scr->screen();
+    armRgbResyncOnTransitionComplete(temp_scr);
+    loadScreenAnim(temp_scr, LV_SCR_LOAD_ANIM_MOVE_BOTTOM, kPageAnimMs);
 }
 
 void PageChain::dismissTemporary() {
@@ -308,9 +294,11 @@ void PageChain::dismissTemporary() {
 
     origin->create();
     origin->enter();
+    afterPageAssetWork();
 
     lv_obj_t* origin_scr = origin->screen();
     if (origin_scr) {
+        armRgbResyncOnTransitionComplete(origin_scr);
         lv_scr_load(origin_scr);
     }
 
@@ -353,7 +341,10 @@ void PageChain::dismissBoot() {
     // Вернули fade: полноэкранный refresh LVGL убрал полосы; FADE_ON снова безопасен для handoff.
     // auto_del deletes Boot screen after the transition; destroy() stops shuttle anim (no stale pointers).
     // auto_del удаляет Boot после перехода; destroy() гасит анимацию shuttle (без висячих указателей).
-    if (mainScr) loadScreenAnimAutoDel(mainScr, LV_SCR_LOAD_ANIM_FADE_ON, kBootHandoffFadeMs);
+    if (mainScr) {
+        armRgbResyncOnTransitionComplete(mainScr);
+        loadScreenAnimAutoDel(mainScr, LV_SCR_LOAD_ANIM_FADE_ON, kBootHandoffFadeMs);
+    }
     _currentIndex = MAIN_INDEX;
 
     _bootScreen->exit();
@@ -376,7 +367,10 @@ void PageChain::dismissBootThenShowRebootRequired(ILvglScreen* scr) {
     scr->enter();
     lv_obj_t* svcScr = scr->screen();
     // Same auto_del fade as dismissBoot→Main; avoids Main::enter / BG preload when STA offline / без Main preload.
-    if (svcScr) loadScreenAnimAutoDel(svcScr, LV_SCR_LOAD_ANIM_FADE_ON, kBootHandoffFadeMs);
+    if (svcScr) {
+        armRgbResyncOnTransitionComplete(svcScr);
+        loadScreenAnimAutoDel(svcScr, LV_SCR_LOAD_ANIM_FADE_ON, kBootHandoffFadeMs);
+    }
 
     _bootScreen->exit();
     _bootScreen->destroy();
@@ -395,7 +389,9 @@ void PageChain::showRebootRequired(ILvglScreen* scr) {
 
     scr->create();
     scr->enter();
-    loadScreenAnim(scr->screen(), LV_SCR_LOAD_ANIM_FADE_IN, kPageAnimMs);
+    lv_obj_t* reboot_scr = scr->screen();
+    armRgbResyncOnTransitionComplete(reboot_scr);
+    loadScreenAnim(reboot_scr, LV_SCR_LOAD_ANIM_FADE_IN, kPageAnimMs);
 }
 
 bool PageChain::isRebootRequiredActiveFor(const ILvglScreen* scr) const {
@@ -412,8 +408,10 @@ void PageChain::dismissRebootRequired() {
     // Load Main before destroying service screen — avoid lv_scr_act() dangling / Main до destroy сервиса.
     main->create();
     main->enter();
+    afterPageAssetWork();
     lv_obj_t* mainScr = main->screen();
     if (mainScr) {
+        armRgbResyncOnTransitionComplete(mainScr);
         lv_scr_load(mainScr);
     }
     _currentIndex = MAIN_INDEX;
@@ -464,6 +462,7 @@ void PageChain::showWifiServiceOneWay(ILvglScreen* scr) {
     lv_obj_t* svc_scr = scr->screen();
 
     if (svc_scr) {
+        armRgbResyncOnTransitionComplete(svc_scr);
         if (blank) {
             // auto_del=true + ANIM_NONE/0/0: LVGL synchronously loads svc_scr and deletes blank.
             // auto_del=true + ANIM_NONE/0/0: LVGL синхронно загружает svc_scr и удаляет blank.
@@ -472,6 +471,7 @@ void PageChain::showWifiServiceOneWay(ILvglScreen* scr) {
             lv_scr_load(svc_scr);
         }
         scr->enter();
+        afterPageAssetWork();
     } else {
         // create() failed — OOM even on freed pool; controlled reboot into normal Main boot.
         // create() провалился — OOM даже на освобождённом пуле; контролируемый reboot в Main boot.

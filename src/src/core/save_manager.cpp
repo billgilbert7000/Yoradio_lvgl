@@ -15,6 +15,7 @@
  * - RAM is source of truth between commits; no per-field EEPROM.put before flush.
  */
 #include "config.h"
+#include "display.h"
 #include "save_manager_sections.h"
 #include <EEPROM.h>
 #include <Preferences.h>
@@ -86,6 +87,53 @@ static void debounceTimerCallback(TimerHandle_t t);
 static void workerTask(void* arg);
 static void runDebouncedCommitFromWorker();
 
+// ---------------------------------------------------------------------------
+// RGB scanout recovery (BASE-DISP-S3-HARDENING / RGB-RESYNC-ALL-RUNTIME-PERSISTENCE)
+//
+// DEVICE-PROVEN: runtime NVS/Preferences persistence desynchronizes the ST7701 RGB scanout
+// exactly like LittleFS does (reproducer: Settings → Weather visibility OFF). Recovery is
+// therefore owed by the whole flash-persistence class, not just LittleFS.
+//
+// Placement is at the *commit episode* boundary, never per key/field/section: the write
+// primitives only record that flash was actually touched, and the enclosing episode requests
+// one resync after its writes are done and the EEPROM mutex is released. A debounce timer that
+// fires on a clean lane writes nothing, sets nothing, and therefore resyncs nothing — so a
+// burst of saveValue() calls (slider drag, tone triple-write) still coalesces into exactly one
+// commit and exactly one resync. The 300 ms debounce cadence is deliberately unchanged.
+//
+// Display::requestRgbResync() is context-aware and safe from the savemgr worker task (it
+// enqueues RGB_RESYNC) and pre-panel (displayQueue is NULL → no-op), so no ordering guard is
+// needed here and no persistence code ever touches DisplayPort directly.
+//
+// DEVICE-PROVEN: рантайм-персистентность NVS/Preferences рассинхронизирует RGB scanout ST7701
+// так же, как LittleFS (репродьюсер: Settings → погода OFF). Восстановление обязано покрывать
+// весь класс flash-персистентности, а не только LittleFS. Точка — граница *эпизода коммита*,
+// никогда не на ключ/поле/секцию: примитивы записи лишь отмечают факт реальной записи во flash,
+// а объемлющий эпизод запрашивает один ресинхрон после завершения записей и освобождения
+// мьютекса. Сработавший на чистой полосе debounce ничего не пишет и ничего не ресинхронит.
+// Каденция debounce 300 мс намеренно не изменена.
+static volatile bool s_flash_mutated;
+
+// Called by the write primitives immediately after flash was actually touched. Deliberately
+// records mutation, not success: a commit that failed after mutating flash still desynchronized
+// the scanout and still owes recovery.
+// Вызывается примитивами записи сразу после реального обращения к flash. Фиксируется именно
+// мутация, а не успех: неуспешный коммит, уже изменивший flash, всё равно должен восстановиться.
+static inline void sm_noteFlashMutated() {
+  s_flash_mutated = true;
+}
+
+// Called at the end of a commit episode, after all writes and after the mutex is released.
+// One-shot read-and-clear → exactly one resync per episode that really wrote.
+// Вызывается в конце эпизода коммита, после всех записей и освобождения мьютекса.
+static inline void sm_finishPersistenceEpisode() {
+  if (!s_flash_mutated) {
+    return;
+  }
+  s_flash_mutated = false;
+  display.requestRgbResync();
+}
+
 static inline bool sm_anyDirty() {
   if (s_dirty) return true;
 #if SM_V2_ENABLED
@@ -120,6 +168,7 @@ static void commitV1FullStoreUnderMutex() {
   if (!EEPROM.commit()) {
     SM_LOG("EEPROM.commit FAILED");
   }
+  sm_noteFlashMutated();
   s_dirty = false;
   SM_LOG("EEPROM.put+commit end");
   smLogReadback("commit");
@@ -147,6 +196,9 @@ static void commitV2DirtySectionsUnderMutex() {
   // fails we re-set the bit so the next flush retries it.
   const uint32_t mask = s_dirty_v2_mask;
   s_dirty_v2_mask = 0u;
+  // mask != 0 here, so at least one section blob write is about to hit NVS.
+  // mask != 0, значит хотя бы одна секция сейчас будет записана в NVS.
+  sm_noteFlashMutated();
 #if SM_DIAG_PERSIST
   SM_LOG("v2 commit: mask=0x%x", (unsigned)mask);
 #endif
@@ -188,6 +240,7 @@ static void runDebouncedCommitFromWorker() {
       commitV1FullStoreUnderMutex();
 #endif
     }
+    sm_finishPersistenceEpisode();
     return;
   }
   if (xSemaphoreTake(s_eeprom_mutex, portMAX_DELAY) != pdTRUE) {
@@ -210,6 +263,11 @@ static void runDebouncedCommitFromWorker() {
 #endif
   }
   xSemaphoreGive(s_eeprom_mutex);
+  // After the mutex is released: one resync for this whole debounced commit batch, however
+  // many sections it wrote. A clean wakeup wrote nothing and requests nothing.
+  // После освобождения мьютекса: один ресинхрон на всю debounce-пачку, сколько бы секций она
+  // ни записала. «Чистое» пробуждение ничего не пишет и ничего не запрашивает.
+  sm_finishPersistenceEpisode();
 }
 
 static void debounceTimerCallback(TimerHandle_t t) {
@@ -379,6 +437,7 @@ void onStoreWriteCompleted(bool commitRequested) {
       if (xSemaphoreTake(s_eeprom_mutex, portMAX_DELAY) == pdTRUE) {
         EEPROM.put(EEPROM_START, config.store);
         EEPROM.commit();
+        sm_noteFlashMutated();
         s_dirty = false;
         smLogReadback("immediate");
         xSemaphoreGive(s_eeprom_mutex);
@@ -386,9 +445,15 @@ void onStoreWriteCompleted(bool commitRequested) {
     } else {
       EEPROM.put(EEPROM_START, config.store);
       EEPROM.commit();
+      sm_noteFlashMutated();
       s_dirty = false;
       smLogReadback("immediate");
     }
+    // Pre-init (SM_V2_ENABLED=0 builds only): panel is not up, so this resolves to a no-op.
+    // Kept for uniformity — every write primitive is followed by an episode boundary.
+    // Pre-init (только сборки SM_V2_ENABLED=0): панель ещё не поднята, вызов вырождается в
+    // no-op. Оставлено для единообразия — за каждым примитивом записи следует граница эпизода.
+    sm_finishPersistenceEpisode();
     return;
   }
   if (s_ota_suspended) {
@@ -414,11 +479,13 @@ void syncFullStoreNow() {
   if (!s_eeprom_mutex) {
     EEPROM.put(EEPROM_START, config.store);
     EEPROM.commit();
+    sm_noteFlashMutated();
     s_dirty = false;
 #if SM_V2_ENABLED
     sm::v2::refreshManagedSectionsFromStore();
     s_dirty_v2_mask = 0u;
 #endif
+    sm_finishPersistenceEpisode();
     return;
   }
   if (xSemaphoreTake(s_eeprom_mutex, portMAX_DELAY) != pdTRUE) {
@@ -426,6 +493,7 @@ void syncFullStoreNow() {
   }
   EEPROM.put(EEPROM_START, config.store);
   EEPROM.commit();
+  sm_noteFlashMutated();
   s_dirty = false;
 #if SM_V2_ENABLED
   // Keep v2 section blobs consistent with the freshly-written legacy snapshot,
@@ -435,6 +503,12 @@ void syncFullStoreNow() {
   s_dirty_v2_mask = 0u;
 #endif
   xSemaphoreGive(s_eeprom_mutex);
+  // Unconditional full mirror + blob refresh: this path always writes. Callers are factory
+  // reset (reboot follows) and boot-time defaults/migration (pre-panel, no-op) — the resync is
+  // requested for consistency and is harmless in both.
+  // Этот путь пишет всегда. Вызовы — сброс к заводским (далее reboot) и дефолты/миграция на
+  // старте (до панели, no-op); ресинхрон запрашивается для единообразия и безвреден в обоих.
+  sm_finishPersistenceEpisode();
 }
 
 void syncIrBlobNow(const void* data, size_t len, int eepromOffset) {
@@ -444,6 +518,8 @@ void syncIrBlobNow(const void* data, size_t len, int eepromOffset) {
       EEPROM.write(eepromOffset + static_cast<int>(i), p[i]);
     }
     EEPROM.commit();
+    sm_noteFlashMutated();
+    sm_finishPersistenceEpisode();
     return;
   }
   if (xSemaphoreTake(s_eeprom_mutex, portMAX_DELAY) != pdTRUE) {
@@ -454,7 +530,13 @@ void syncIrBlobNow(const void* data, size_t len, int eepromOffset) {
     EEPROM.write(eepromOffset + static_cast<int>(i), p[i]);
   }
   EEPROM.commit();
+  sm_noteFlashMutated();
   xSemaphoreGive(s_eeprom_mutex);
+  // IR blob lives outside config_t and outside the v2 section table, so it has no debounced
+  // lane — the whole learn/save gesture is this one call. One resync closes it.
+  // IR-блоб вне config_t и вне таблицы секций v2, debounce-полосы у него нет — весь жест
+  // обучения/сохранения это один вызов. Один ресинхрон его закрывает.
+  sm_finishPersistenceEpisode();
 }
 
 void flushSync() {
@@ -476,6 +558,7 @@ void flushSync() {
 #else
     commitV1FullStoreUnderMutex();
 #endif
+    sm_finishPersistenceEpisode();
     return;
   }
   if (xSemaphoreTake(s_eeprom_mutex, portMAX_DELAY) != pdTRUE) {
@@ -491,6 +574,11 @@ void flushSync() {
   commitV1FullStoreUnderMutex();
 #endif
   xSemaphoreGive(s_eeprom_mutex);
+  // Callers that continue running (resumeAfterOta, sleep-timer shutdown flush) get their
+  // recovery here; systemRestart() reboots immediately after, where it is moot.
+  // Вызовы, после которых runtime продолжается (resumeAfterOta, flush при засыпании), получают
+  // восстановление здесь; systemRestart() сразу перезагружается — там оно не имеет значения.
+  sm_finishPersistenceEpisode();
 }
 
 void flushAsync() {
@@ -621,6 +709,11 @@ void onFieldWrittenV2(const void* field_ptr, size_t field_size, bool commit_requ
         commitV1FullStoreUnderMutex();
       }
     }
+    // Pre-init window: this runs before the panel exists, so the request degrades to a no-op
+    // (displayQueue is still NULL). Startup geometry stays owned by the EARLY/LATE resyncs.
+    // Окно pre-init: выполняется до появления панели, запрос вырождается в no-op (displayQueue
+    // ещё NULL). За геометрию старта по-прежнему отвечают EARLY/LATE ресинхроны.
+    sm_finishPersistenceEpisode();
     return;
   }
   if (s_ota_suspended) {
@@ -667,8 +760,20 @@ constexpr const char* kV2Namespace = "yo_sm_v2";
 //                    overlay of older smaller `ai` blobs + tail defaults.
 //   v10:             Ai tail grew (sleep_timer_action, CONFIG_VERSION 8). Partial
 //                    overlay of older smaller `ai` blobs + tail defaults.
+//   v11:             Ai tail grew (performance_monitor, CONFIG_VERSION 9). Partial
+//                    overlay of older smaller `ai` blobs + tail defaults.
+//   v12:             Ai tail grew (FU6-A text_scroll_speed/type/delay_s, CONFIG_VERSION 10).
+//                    Partial overlay of older smaller `ai` blobs + tail defaults; the zero-filled
+//                    tail is then seeded by Config::_setupVersion() case 9.
+//   v13:             Ai tail grew (deep_sleep_wake_after_minutes, CONFIG_VERSION 11). Partial overlay
+//                    of older smaller `ai` blobs + tail defaults; the zero-filled tail is then
+//                    seeded by Config::_setupVersion() case 10.
+//   v14:             Ai tail grew (three TIMERS presets, CONFIG_VERSION 12). Partial overlay of
+//                    the v13 prefix preserves the renamed wake field; case 11 seeds only new bytes.
+//   v15:             Ai tail grew (four TIMERS enabled flags, CONFIG_VERSION 13). Case 12 derives
+//                    migrated enabled state from the preserved duration presets.
 constexpr const char* kV2MarkerKey = "v2m";
-constexpr uint32_t kV2SchemaVersion = 10u;
+constexpr uint32_t kV2SchemaVersion = 15u;
 
 // Legacy blob sentinel — `config.store.config_set` magic (see config.cpp / config.h).
 constexpr uint16_t kLegacyMagic = 4262u;
@@ -915,6 +1020,11 @@ void runBootMigrationIfNeeded() {
       }
       // v8 -> v9: Ai tail grew (autodim_*); partial overlay in loadSection().
       // v9 -> v10: Ai tail grew (sleep_timer_action); partial overlay in loadSection().
+      // v10 -> v11: Ai tail grew (performance_monitor); partial overlay in loadSection().
+      // v11 -> v12: Ai tail grew (FU6-A text scrolling); partial overlay in loadSection().
+      // v12 -> v13: Ai tail grew (Deep Sleep wake preset); partial overlay in loadSection().
+      // v13 -> v14: Ai tail grew (three TIMERS presets); partial overlay in loadSection().
+      // v14 -> v15: Ai tail grew (four TIMERS enabled flags); partial overlay in loadSection().
       // Add future schema steps ABOVE in ascending order.
       if (!writeMarker()) {
         SM_LOG("v2 upgrade: writeMarker FAILED — upgrade will retry on next boot");

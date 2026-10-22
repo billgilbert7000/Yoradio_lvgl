@@ -21,6 +21,7 @@
 #include "Arduino.h"
 #include <cstring>
 #include "../profiles/lv_profile_select.h"
+#include "../font_provider.h"
 #include "../assets/bootlogo_assets.h"
 #include "../../i18n/i18n.h"
 
@@ -35,7 +36,7 @@ namespace {
 // ─────────────────────────────────────────────────────────────────────────────
 
 static const lv_font_t* boot_status_font() {
-    return static_cast<const lv_font_t*>(LV_ACTIVE_PROFILE.font_header);
+    return FontProvider::text(LV_ACTIVE_PROFILE.font_header_px);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -55,11 +56,13 @@ static const lv_color_t kBootFixedStatusText  = lv_color_hex(0xCCCCCC);
 // Средний ассет для широких экранов; вместо прежнего крупного 211×177.
 static const lv_img_dsc_t s_boot_logo_dsc_medium = {
     .header = {
-        .cf = LV_IMG_CF_TRUE_COLOR,
-        .always_zero = 0,
-        .reserved = 0,
+        .magic = LV_IMAGE_HEADER_MAGIC,
+        .cf = LV_COLOR_FORMAT_RGB565,
+        .flags = 0,
         .w = YORADIO_BOOTLOGO_MEDIUM_W,
         .h = YORADIO_BOOTLOGO_MEDIUM_H,
+        .stride = static_cast<uint32_t>(YORADIO_BOOTLOGO_MEDIUM_W * sizeof(uint16_t)),
+        .reserved_2 = 0,
     },
     .data_size =
         static_cast<uint32_t>(YORADIO_BOOTLOGO_MEDIUM_W * YORADIO_BOOTLOGO_MEDIUM_H * sizeof(uint16_t)),
@@ -70,11 +73,13 @@ static const lv_img_dsc_t s_boot_logo_dsc_medium = {
 // Компактный ассет для узких экранов (≤ kBootLogoSmallAssetMaxScreenW).
 static const lv_img_dsc_t s_boot_logo_dsc_small = {
     .header = {
-        .cf = LV_IMG_CF_TRUE_COLOR,
-        .always_zero = 0,
-        .reserved = 0,
+        .magic = LV_IMAGE_HEADER_MAGIC,
+        .cf = LV_COLOR_FORMAT_RGB565,
+        .flags = 0,
         .w = YORADIO_BOOTLOGO_SMALL_W,
         .h = YORADIO_BOOTLOGO_SMALL_H,
+        .stride = static_cast<uint32_t>(YORADIO_BOOTLOGO_SMALL_W * sizeof(uint16_t)),
+        .reserved_2 = 0,
     },
     .data_size =
         static_cast<uint32_t>(YORADIO_BOOTLOGO_SMALL_W * YORADIO_BOOTLOGO_SMALL_H * sizeof(uint16_t)),

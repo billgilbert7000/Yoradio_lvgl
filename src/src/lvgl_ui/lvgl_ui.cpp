@@ -2,8 +2,10 @@
 #include "lvgl_ui.h"
 #include "lv_overlay.h"
 #include "lv_screensaver.h"
+#include "lv_text_scroll.h"
 #include "lv_touch_indev.h"
 #include "lv_ui_events.h"
+#include "font_provider.h"
 #include "profiles/lv_profile_select.h"
 #include "theme/lv_theme_yoradio.h"
 #include "lv_fs_littlefs.h"
@@ -29,13 +31,15 @@
 #include "screens/scr_wifi_flow.h"
 #include "../core/autodim.h"
 #include "../core/display.h"
+#include "../core/config.h"
 #include "../core/options.h"
-#include "../core/spidog.h"
 #if DSP_MODEL == DSP_ST7701
-#include <Arduino_GFX.h>  // flush() on Arduino_GFX; getOutputDisplay() returns Arduino_G*
+#include "../displays/display_port.h"
 #endif
 #include "../core/network.h"
 #include "../core/wifi_ops_adapter.h"
+#include "../i18n/i18n.h"
+#include "main_bg_jpeg.h"
 
 using namespace lvgl_ui;
 
@@ -97,6 +101,55 @@ static bool preset_open_gesture_allowed() {
     return preset_carousel_slot_allowed(s_page_chain.currentIndex());
 }
 
+// EXEC-01D: pending carousel direction, applied from taskHandler() AFTER lv_timer_handler()
+// returns. LV_DIR_NONE = nothing pending. DspTask-owned only (set in the gesture callback,
+// consumed in taskHandler(), both on DspTask) — no queue/mutex/cross-task state.
+// One pending direction is sufficient and deterministic: the request is consumed on the very
+// same DspTask iteration that dispatched the gesture, so a second gesture cannot arrive in
+// between; a later gesture simply overwrites a (by then already consumed) slot.
+// EXEC-01D: отложенное направление карусели; применяется в taskHandler() ПОСЛЕ возврата из
+// lv_timer_handler(). Только DspTask — без очередей и мьютексов.
+static lv_dir_t s_deferred_carousel_dir = LV_DIR_NONE;
+
+// Repair E / Slice 6C: runtime RGB recovery owed after normal LVGL paint (theme / JPEG / A2 / FS).
+// DspTask-only; no mutex. Multiple marks collapse to one recovery on the first quiescent iteration.
+// Repair E / слайс 6C: долг RGB recovery после обычной отрисовки. Только DspTask; без mutex.
+// Несколько меток схлопываются в одно восстановление на первой спокойной итерации.
+static bool s_runtime_rgb_recovery_pending = false;
+static bool s_runtime_recovery_batch_busy = false;
+
+// S6-THEME-01: latest-wins Theme coalescing. One tap used to run the whole heavy
+// transaction (LVGL style reset + global invalidation + /data/theme.dat write + page
+// reapply) synchronously from the LV_EVENT_CLICKED callback, so a rapid burst stacked
+// several of them on DspTask and starved IDLE0 into a task WDT. Requests are now cheap;
+// the apply runs once, for the final selection, on a quiet iteration — gated by the same
+// Repair-E busy contract rather than a competing notion of "display busy".
+// DspTask-only state; no mutex needed.
+// S6-THEME-01: коалесинг темы latest-wins. Раньше одно нажатие выполняло всю тяжёлую
+// транзакцию синхронно из LV_EVENT_CLICKED, поэтому быстрая серия копила их на DspTask
+// и доводила IDLE0 до task WDT. Теперь запрос дешёвый; применение — один раз, для
+// финального выбора, на спокойной итерации по тому же контракту Repair-E.
+// Состояние только для DspTask; mutex не нужен.
+static constexpr uint32_t kThemeApplyQuietMs = 150;
+static ThemePreset s_theme_requested       = ThemePreset::Dark;
+static ThemePreset s_theme_applied         = ThemePreset::Dark;
+static bool        s_theme_apply_pending   = false;
+static bool        s_theme_apply_in_progress = false;
+static bool        s_theme_state_seeded    = false;
+static uint32_t    s_theme_request_ms      = 0;
+
+// Seed both halves from the canonical preset so no invalid/uninitialised value can leak
+// into cycling or into the Settings label before the first request.
+// Инициализация обеих половин от канонического пресета — чтобы до первого запроса
+// в цикл и в метку Settings не попало некорректное значение.
+static void themeSeedStateOnce() {
+    if (s_theme_state_seeded) return;
+    const ThemePreset current = yoradio_theme_active_preset();
+    s_theme_requested = current;
+    s_theme_applied   = current;
+    s_theme_state_seeded = true;
+}
+
 // Horizontal carousel: direct mapping from LVGL gesture dir.
 // X normalization is now in lv_touch_read_cb — no per-board swap needed here.
 // Горизонтальная карусель: прямой маппинг из gesture dir (нормализация X теперь в lv_touch_read_cb).
@@ -131,7 +184,20 @@ static void carousel_gesture_event_cb(lv_event_t* e) {
     if (isLvglCarouselOnSettingsSlot() && s_settings_page.isSettingsDetailBlockingCarousel()) return;
 
     s_page_chain.onActivity();
-    map_horizontal_gesture_to_carousel(dir);
+    // EXEC-01D (BASE-LVGL9-MIGRATION): do NOT switch pages from inside LVGL's event dispatch.
+    // This callback is registered on the screen ROOT (see installCarouselGesturesOnPageRoot),
+    // and PageChain::goTo() ends in lv_scr_load_anim(..., auto_del=true) with ANIM_NONE/0/0,
+    // which makes LVGL synchronously lv_obj_delete() that same screen root while lv_event_send()
+    // is still iterating this root's event list. LVGL then frees the object's spec_attr — the
+    // block physically containing that event list — and the dispatch unwind releases the
+    // descriptor array a second time from a stale snapshot: a double free that corrupts the
+    // TLSF pool (surfacing later as StoreProhibited in insert_free_block).
+    // Defer instead: taskHandler() applies this once lv_timer_handler() has returned, i.e. the
+    // same out-of-dispatch lifecycle poll_top_edge_swipe() already uses safely for Preset.
+    // EXEC-01D: не переключаем страницу изнутри диспетчеризации событий LVGL — callback висит на
+    // КОРНЕ экрана, а goTo() синхронно удаляет этот же корень (auto_del) во время обхода его
+    // списка событий → double free и порча пула TLSF. Откладываем до taskHandler().
+    s_deferred_carousel_dir = dir;
     // Consume so child widgets don't receive click/SHORT_CLICKED for the same stroke.
     // Поглощаем, чтобы дочерние виджеты не получали click за тот же жест.
     lv_indev_wait_release(indev);
@@ -179,10 +245,20 @@ static void poll_top_edge_swipe() {
 
 // True while Boot special mode is shown (Stage 5.4). / Пока виден Boot (этап 5.4).
 static bool s_lvgl_boot_active = false;
-// millis() when LVGL Boot was shown — min dwell before Main handoff (legacy boot had ~3s logo dwell).
-// Время показа Boot — минимум на экране до перехода на Main (как ~3s лого в legacy).
+// millis() when LVGL Boot was shown — used by Wi-Fi Recovery min dwell only.
+// Время показа Boot — только для минимальной паузы Wi-Fi Recovery.
 static uint32_t s_lvgl_boot_shown_ms = 0;
-static constexpr uint32_t kLvglBootMinVisibleMs = 3000;
+static constexpr uint32_t kLvglBootMinVisibleMs = 3000; // Wi-Fi Recovery path only / только Recovery
+static constexpr uint32_t kBootLoadingMinVisibleMs = 400; // brief Loading text, not extra 3s after JPEG
+static bool s_main_bg_boot_status_shown = false;
+// Boot JPEG request handed to the MainBgJpeg worker. Latched like the two flags around it:
+// Boot runs once per cold boot (_bootStep returns to 0 only in Display::init()), so there is
+// no reset path to mirror.
+// Запрос JPEG отдан worker'у MainBgJpeg. Латчится как и соседние флаги: Boot проходит один раз
+// за холодный старт (_bootStep обнуляется только в Display::init()), сбрасывать негде.
+static bool s_main_bg_boot_request_issued = false;
+static bool s_main_bg_boot_prepare_done = false;
+static uint32_t s_main_bg_loading_shown_ms = 0;
 
 static void ensurePageChainRegistered() {
     static bool s_registered = false;
@@ -206,10 +282,10 @@ static void lvgl_tick_cb(void *arg) {
 static esp_timer_handle_t s_lv_tick_timer = nullptr;
 
 // LVGL display driver state / Состояние драйвера дисплея LVGL
-static lv_disp_draw_buf_t s_disp_draw_buf;
-static lv_color_t*        s_disp_buf1 = nullptr;
-static lv_disp_drv_t      s_disp_drv;
-static lv_disp_t*         s_disp = nullptr;
+// BASE-LVGL9-MIGRATION C2: lv_disp_draw_buf_t / lv_disp_drv_t removed in LVGL 9 — a single
+// lv_display_t owns buffer + flush registration now (lv_display_create/set_buffers/set_flush_cb).
+static uint8_t*       s_disp_buf1 = nullptr;
+static lv_display_t*  s_disp = nullptr;
 
 #if DSP_MODEL == DSP_ST7701
 // Block 8-E5: partial PSRAM stripe height for diag (0 until initDisplayDriver).
@@ -223,29 +299,43 @@ static uint32_t s_lvgl_flush_count = 0;
 static uint32_t s_lvgl_last_flush_ms = 0;
 
 #if DSP_MODEL == DSP_ST7701
-// Block 8-E3/E17/E18C (4848S040): LVGL → output_display directly; no Arduino_Canvas on product path.
-// Block 8-E3/E17/E18C: LVGL → output_display; Canvas снят (E17), legacy dirty flush отключён (E18C).
-static void lvgl_flush_direct_panel(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p) {
-    Arduino_G* panel_g = dsp.getOutputDisplay();
-    if (!panel_g || !color_p || !area) {
-        lv_disp_flush_ready(drv);
+// LVGL clip/pointer prep → DisplayPort::flush → active physical backend.
+// The callback is backend-agnostic and must stay that way.
+// clip/pointer LVGL → DisplayPort::flush → активный физический backend.
+// Callback остаётся backend-agnostic.
+// Diagnostics + flush_ready run in done(ctx) so order matches the pre-cutover path.
+// Диагностика + flush_ready в done(ctx), чтобы порядок совпал с pre-cutover.
+static void lvgl_display_port_flush_done(void* ctx) {
+    lv_display_t* disp = static_cast<lv_display_t*>(ctx);
+    s_lvgl_flush_count++;
+    s_lvgl_last_flush_ms = millis();
+    lvgl_ui::recordLvglDirectPanelFlush();
+    lv_display_flush_ready(disp);
+}
+
+// BASE-LVGL9-MIGRATION C2: flush_cb signature is (lv_display_t*, area, uint8_t* px_map);
+// px_map cast to uint16_t* only at this boundary (RGB565, no byte swap).
+static void lvgl_flush_direct_panel(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
+    // Early no-op paths: ready without hardware-flush diagnostics (unchanged).
+    // Ранние no-op: ready без диагностики hardware-flush (без изменений).
+    if (!px_map || !area) {
+        lv_display_flush_ready(disp);
         return;
     }
-    Arduino_GFX* panel = static_cast<Arduino_GFX*>(panel_g);
 
     int32_t x1 = area->x1;
     int32_t y1 = area->y1;
     int32_t x2 = area->x2;
     int32_t y2 = area->y2;
     if (x2 < x1 || y2 < y1) {
-        lv_disp_flush_ready(drv);
+        lv_display_flush_ready(disp);
         return;
     }
 
-    const int32_t hor = static_cast<int32_t>(drv->hor_res);
-    const int32_t ver = static_cast<int32_t>(drv->ver_res);
+    const int32_t hor = lv_display_get_horizontal_resolution(disp);
+    const int32_t ver = lv_display_get_vertical_resolution(disp);
     if (x1 >= hor || y1 >= ver) {
-        lv_disp_flush_ready(drv);
+        lv_display_flush_ready(disp);
         return;
     }
     if (x2 >= hor) x2 = hor - 1;
@@ -254,35 +344,36 @@ static void lvgl_flush_direct_panel(lv_disp_drv_t *drv, const lv_area_t *area, l
     const int32_t w = x2 - x1 + 1;
     const int32_t h = y2 - y1 + 1;
     const int32_t src_stride = area->x2 - area->x1 + 1;
-    uint16_t* px = reinterpret_cast<uint16_t*>(color_p);
+    uint16_t* px = reinterpret_cast<uint16_t*>(px_map);
     if (x1 != area->x1 || y1 != area->y1) {
         px += static_cast<int32_t>(y1 - area->y1) * src_stride + (x1 - area->x1);
     }
+    (void)w;
+    (void)h;
 
-    sdog.takeMutex();
-    panel_g->draw16bitRGBBitmap(x1, y1, px, w, h);
-    panel->flush();
-    sdog.giveMutex();
+    const DisplayArea port_area{
+        static_cast<int16_t>(x1),
+        static_cast<int16_t>(y1),
+        static_cast<int16_t>(x2),
+        static_cast<int16_t>(y2)};
 
-    s_lvgl_flush_count++;
-    s_lvgl_last_flush_ms = millis();
-    lvgl_ui::recordLvglDirectPanelFlush();
-
-    lv_disp_flush_ready(drv);
+    // Stable ctx: lv_display_t* (not stack-local). Backend still completes synchronously today.
+    // Стабильный ctx: lv_display_t* (не stack-local). Backend пока синхронный.
+    DisplayPort::flush(port_area, px, lvgl_display_port_flush_done, disp);
 }
 #endif
 
-// Flush callback: LVGL product path → output_display direct only (E5C). Canvas fallback removed (E18D).
-// Flush callback: только прямой вывод на panel (E5C); Canvas fallback удалён (E18D).
-static void lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_p) {
+// Flush callback: LVGL → DisplayPort (E5C topology unchanged). Canvas fallback removed (E18D).
+// Flush callback: LVGL → DisplayPort (топология E5C без изменений). Canvas fallback удалён (E18D).
+static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
 #if DSP_MODEL == DSP_ST7701
-    lvgl_flush_direct_panel(drv, area, color_p);
+    lvgl_flush_direct_panel(disp, area, px_map);
 #else
     // Non-ST7701 envs: legacy Canvas LVGL flush not supported on this fork (E18D).
     // Иные env: Canvas LVGL flush не поддерживается на этом форке (E18D).
     (void)area;
-    (void)color_p;
-    lv_disp_flush_ready(drv);
+    (void)px_map;
+    lv_display_flush_ready(disp);
 #endif
 }
 
@@ -294,13 +385,21 @@ static bool lvgl_page_refresh_allowed() {
 }
 
 #if LV_USE_PERF_MONITOR
-// Stock LVGL perf label: TOP_RIGHT + auto width → we pin left of a fixed box + right text (no digit jump).
-// Встроенный perf label: фикс. ширина + текст справа — левый край блока не смещается при 4%↔10% CPU.
-static constexpr lv_coord_t kLvglPerfMonitorLabelW = 76; // fits "50 FPS\n100% CPU" / под двузначные FPS/CPU
+// Stage EXEC-01B-PERF: positioned right of the status-line clock, not screen-left — v9's label text
+// ("NN FPS, NN% CPU" / "NN ms (NN | NN)") is wider than v8's two short lines, so the box now grows
+// dynamically to the right screen edge instead of using a fixed width (avoids left-side clipping).
+// Оверлей — справа от часов в статус-строке; ширина считается динамически до края экрана (v9-текст
+// шире v8), чтобы не обрезался слева, как при фиксированной ширине под старый формат.
 
 // Stage 6.6R-GB2: cached perf-label so theme switches can recolor it without rescanning sys layer.
 // Этап 6.6R-GB2: кэш perf-label — перекраска при смене темы без повторного скана sys-слоя.
 static lv_obj_t* s_perf_label = nullptr;
+// L1-B: one-shot presentation lookup is armed only while the monitor is ON and not yet styled.
+// Default OFF pauses before the first dump (label stays "?"), so an un-gated scan would run forever.
+// L1-B: одноразовый lookup только при ON, пока стиль не применён. OFF на boot ставит pause до
+// первого dump (текст "?") — без гейта скан шёл бы на каждой итерации DspTask бесконечно.
+static bool s_perf_presentation_applied = false;
+static bool s_perf_lookup_pending = false;
 
 // Apply theme-aware text color to the debug perf overlay (transparent bg → text must read on any theme).
 // Light → graphite text_primary; Dark/Custom-dark → their light text_primary. Always readable by palette design.
@@ -311,26 +410,34 @@ static void applyPerfMonitorThemeTextColor() {
 }
 
 static void repositionBuiltinLvglPerfMonitorOnce() {
-    static bool s_done = false;
-    if (s_done) return;
+    if (s_perf_presentation_applied) {
+        s_perf_lookup_pending = false;
+        return;
+    }
     lv_obj_t* sys = lv_layer_sys();
     if (!sys) return;
-    const uint32_t n = lv_obj_get_child_cnt(sys);
+    const uint32_t n = lv_obj_get_child_count(sys);
     for (uint32_t i = 0; i < n; ++i) {
         lv_obj_t* ch = lv_obj_get_child(sys, i);
         if (!ch || lv_obj_get_class(ch) != &lv_label_class) continue;
         const char* txt = lv_label_get_text(ch);
         if (!txt || std::strstr(txt, "FPS") == nullptr) continue;
 
-        lv_disp_t* d = lv_disp_get_default();
-        const lv_coord_t w =
-            d ? static_cast<lv_coord_t>(lv_disp_get_hor_res(d)) : static_cast<lv_coord_t>(LV_ACTIVE_PROFILE.width);
-        const lv_coord_t x_est = (w * 12) / 100;
-        const lv_coord_t x0   = x_est > 40 ? x_est : 40;
+        lv_display_t* d = s_disp ? s_disp : lv_display_get_default();
+        const int32_t w =
+            d ? static_cast<int32_t>(lv_display_get_horizontal_resolution(d)) : static_cast<int32_t>(LV_ACTIVE_PROFILE.width);
+        // wgt_status_line centers the clock in the screen's middle third (status line = 3 equal flex
+        // columns), so the clock's right edge sits well left of screen-center + 40. Anchor there and
+        // grow to a right margin, so the box is "right of the clock" and never clips regardless of
+        // exact clock glyph width.
+        // Часы центрированы в средней трети статус-строки; их правый край — левее center+40. Бокс
+        // растёт до правого края экрана, поэтому не обрезается вне зависимости от ширины часов.
+        const int32_t x0    = (w / 2) + 40;
+        const int32_t box_w = w - x0 - 8;
 
-        lv_obj_set_width(ch, kLvglPerfMonitorLabelW);
-        lv_obj_set_style_text_align(ch, LV_TEXT_ALIGN_RIGHT, LV_PART_MAIN);
-        lv_label_set_long_mode(ch, LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(ch, box_w > 0 ? box_w : LV_SIZE_CONTENT);
+        lv_obj_set_style_text_align(ch, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+        lv_label_set_long_mode(ch, LV_LABEL_LONG_MODE_CLIP);
         lv_obj_align(ch, LV_ALIGN_TOP_LEFT, x0, 2);
         // Stage 6.6R-GB1: perf monitor is a debug overlay — drop its default grey pill so it does not
         // clash with the Light theme. Background stays transparent.
@@ -341,11 +448,34 @@ static void repositionBuiltinLvglPerfMonitorOnce() {
         // 6.6R-GB2: тема-зависимый цвет текста (белый сливался на Light).
         s_perf_label = ch;
         applyPerfMonitorThemeTextColor();
-        s_done = true;
+        s_perf_presentation_applied = true;
+        s_perf_lookup_pending = false;
         break;
     }
 }
 #endif
+
+void lvgl_ui::applyPerformanceMonitorState(bool enabled) {
+#if LV_USE_PERF_MONITOR
+    if (!s_disp) return;
+    if (enabled) {
+        lv_sysmon_show_performance(s_disp);
+        lv_sysmon_performance_resume(s_disp);
+        // Re-arm one-shot L1 presentation only until the existing label is styled once.
+        // Hide/show/pause/resume keep the same object; later ON does not rescan.
+        // Одноразовый L1 только пока стиль не применён. Hide/show/pause/resume тот же объект.
+        if (!s_perf_presentation_applied) {
+            s_perf_lookup_pending = true;
+        }
+    } else {
+        lv_sysmon_performance_pause(s_disp);
+        lv_sysmon_hide_performance(s_disp);
+        s_perf_lookup_pending = false;
+    }
+#else
+    (void)enabled;
+#endif
+}
 
 void lvgl_ui::refreshInfoScreen() {
     if (!lvgl_page_refresh_allowed()) return;
@@ -436,11 +566,38 @@ void lvgl_ui::onThemePresetChanged(uint8_t preset_id) {
     // Clamp to valid range; unknown preset falls back to Dark / Некорректный ID → Dark.
     if (preset_id > 2u) preset_id = 0u;
 
-    const ThemePreset next = static_cast<ThemePreset>(preset_id);
+    // S6-THEME-01: record the intent only. Both entry points (Settings LV_EVENT_CLICKED and
+    // the WebUI SET_THEME_PRESET queue message) land here, so both are coalesced identically
+    // and neither runs LVGL theme work inside event/queue dispatch.
+    // S6-THEME-01: только фиксируем намерение. Оба входа (клик в Settings и сообщение
+    // SET_THEME_PRESET из WebUI) приходят сюда, поэтому коалесинг одинаков, и ни один
+    // не выполняет работу с темой LVGL внутри диспетчеризации.
+    themeSeedStateOnce();
+    s_theme_requested     = static_cast<ThemePreset>(preset_id);
+    s_theme_apply_pending = true;
+    s_theme_request_ms    = millis();
+}
 
+ThemePreset lvgl_ui::themeRequestedPreset() {
+    themeSeedStateOnce();
+    return s_theme_requested;
+}
+
+// The heavy Theme transaction. Ordering is preserved from the pre-S6-THEME-01
+// onThemePresetChanged(); only the trigger moved. Runs on DspTask, after the LVGL
+// event/timer traversal has returned — never from inside it.
+// Тяжёлая транзакция темы. Порядок шагов сохранён от прежнего onThemePresetChanged();
+// изменился только триггер. Выполняется на DspTask после возврата из обхода событий LVGL.
+static void applyThemePresetNow(ThemePreset next) {
     // 1. Switch palette state — all subsequent yoradio_palette() calls return new preset.
     // 1. Переключить палитру — все вызовы yoradio_palette() вернут новый пресет.
     yoradio_theme_set_preset(next);
+
+    mainBgCacheInvalidate();
+    Serial.printf("[MAIN_BG] Theme changed: %s\n",
+                  (next == ThemePreset::Light) ? "Light" :
+                  (next == ThemePreset::Custom) ? "Custom" : "Dark");
+    mainBgCacheRequestAsync(mainBgResolvedJpegPathForSlot(static_cast<uint8_t>(next)));
 
     // Stage 6.6R-E: persist preset name to /data/theme.dat (LittleFS, not NVS/config_t).
     // Этап 6.6R-E: сохранить пресет в /data/theme.dat.
@@ -469,6 +626,10 @@ void lvgl_ui::onThemePresetChanged(uint8_t preset_id) {
     // 6.6R-GB2: сохранить читаемость текста debug-оверлея после смены темы.
     applyPerfMonitorThemeTextColor();
 #endif
+    // Repair E: theme.dat + reinit still owe recovery; run it after this iteration's LVGL paint.
+    // Repair E: theme.dat + reinit должны восстановиться после paint.
+    requestRuntimeRgbRecovery();
+    noteDisplayBatchBusy();
 }
 
 // Stage 0: stub — confirms LVGL library is compiled into the build
@@ -485,6 +646,12 @@ void lvgl_ui::initRuntime() {
     // Stage 6.1F-b: LVGL file API → same LittleFS mount as legacy (drive L:).
     // Этап 6.1F-b: файловый API LVGL → тот же LittleFS (диск L:).
     lv_fs_littlefs_register();
+    // FU6-A: normalize the persisted text-scroll bytes once, after Config::init() (main.cpp) and
+    // before any auto-scrolling label is created. Runtime reads sanitize anyway; this only keeps
+    // NVS and the Settings UI in agreement after a migration.
+    // FU6-A: один раз приводим сохранённые байты скролла к норме — после Config::init() и до
+    // создания лейблов. Чтение и так санитизируется; здесь синхронизируем NVS и UI.
+    text_scroll::sanitizeStoredValues();
     s_inited = true;
 }
 
@@ -515,54 +682,57 @@ void lvgl_ui::initDisplayDriver(uint16_t hor_res, uint16_t ver_res) {
     if (s_disp) return;
     if (hor_res == 0 || ver_res == 0) return;
 
+    // BASE-LVGL9-MIGRATION C2: lv_display_t owns buffer + flush registration directly —
+    // no separate lv_disp_draw_buf_t / lv_disp_drv_t. E5C topology unchanged: one PSRAM buffer.
 #if DSP_MODEL == DSP_ST7701
     // Block 8-E5B (4848S040): partial stripe 480×160 (was 80 in 8-E5A); 3 full-screen chunks.
     // Block 8-E5B: полоса 160 строк — тест chunk count для переходов/Station (без UI redesign).
     constexpr uint32_t kPartialLines = 160;
-    const uint32_t px_count = static_cast<uint32_t>(hor_res) * kPartialLines;
+    const uint32_t buf_bytes = static_cast<uint32_t>(hor_res) * kPartialLines * sizeof(uint16_t);
     s_disp_buf_partial_h = static_cast<uint16_t>(kPartialLines);
-    s_disp_buf1 = static_cast<lv_color_t*>(ps_malloc(px_count * sizeof(lv_color_t)));
+    s_disp_buf1 = static_cast<uint8_t*>(ps_malloc(buf_bytes));
     if (!s_disp_buf1) {
         s_disp_buf_partial_h = 0;
         Serial.println("[LVGL] partial draw buffer PSRAM alloc failed, LVGL display disabled");
         return;
     }
-    lv_disp_draw_buf_init(&s_disp_draw_buf, s_disp_buf1, nullptr, px_count);
+
+    s_disp = lv_display_create(hor_res, ver_res);
+    if (!s_disp) {
+        Serial.println("[LVGL] lv_display_create failed, LVGL display disabled");
+        return;
+    }
+    lv_display_set_color_format(s_disp, LV_COLOR_FORMAT_RGB565);
+    lv_display_set_flush_cb(s_disp, lvgl_flush_cb);
+    lv_display_set_buffers(s_disp, s_disp_buf1, nullptr, buf_bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
 #else
-    // Full-frame draw buffer + full_refresh: partial stripes on a shared Arduino_Canvas caused
-    // visible “black rectangles” / tearing during Boot→Main (M0 Canvas path; not ST7701 post-8-E3).
-    // Полный кадр + full_refresh: на старом Canvas-пути полосы давали артефакты (не ST7701 после 8-E3).
-    const uint32_t lines = ver_res;
-    const uint32_t px_count = static_cast<uint32_t>(hor_res) * lines;
-    s_disp_buf1 = static_cast<lv_color_t*>(ps_malloc(px_count * sizeof(lv_color_t)));
+    // Full-frame draw buffer + FULL render mode: partial stripes on a shared Arduino_Canvas caused
+    // visible "black rectangles" / tearing during Boot->Main (M0 Canvas path; not ST7701 post-8-E3).
+    // Полный кадр + FULL: на старом Canvas-пути полосы давали артефакты (не ST7701 после 8-E3).
+    const uint32_t buf_bytes = static_cast<uint32_t>(hor_res) * ver_res * sizeof(uint16_t);
+    s_disp_buf1 = static_cast<uint8_t*>(ps_malloc(buf_bytes));
     if (!s_disp_buf1) {
         Serial.println("[LVGL] draw buffer PSRAM alloc failed, LVGL display disabled");
         return;
     }
-    lv_disp_draw_buf_init(&s_disp_draw_buf, s_disp_buf1, nullptr, px_count);
-#endif
 
-    lv_disp_drv_init(&s_disp_drv);
-    s_disp_drv.hor_res = hor_res;
-    s_disp_drv.ver_res = ver_res;
-    s_disp_drv.flush_cb = lvgl_flush_cb;
-    s_disp_drv.draw_buf = &s_disp_draw_buf;
-#if DSP_MODEL == DSP_ST7701
-    s_disp_drv.full_refresh = 0;
-#else
-    s_disp_drv.full_refresh = 1;
-#endif
-    s_disp_drv.direct_mode = 0;
-
-    s_disp = lv_disp_drv_register(&s_disp_drv);
+    s_disp = lv_display_create(hor_res, ver_res);
     if (!s_disp) {
-        Serial.println("[LVGL] lv_disp_drv_register failed, LVGL display disabled");
+        Serial.println("[LVGL] lv_display_create failed, LVGL display disabled");
         return;
     }
+    lv_display_set_color_format(s_disp, LV_COLOR_FORMAT_RGB565);
+    lv_display_set_flush_cb(s_disp, lvgl_flush_cb);
+    lv_display_set_buffers(s_disp, s_disp_buf1, nullptr, buf_bytes, LV_DISPLAY_RENDER_MODE_FULL);
+#endif
+
     // Stage 6.6A: LVGL base theme + YoRadio palette — single init point after valid display.
     // Этап 6.6A: базовая тема LVGL + палитра YoRadio — одна точка после валидного дисплея.
     yoradio_theme_init(s_disp);
     initTouchIndev();
+    // S5.6: lv_display_create already auto-showed sysmon; apply persisted OFF/ON before first flush.
+    // S5.6: lv_display_create уже показал sysmon; persisted OFF/ON до первого flush.
+    applyPerformanceMonitorState(config.store.performance_monitor);
 }
 
 void lvgl_ui::taskHandler() {
@@ -571,9 +741,84 @@ void lvgl_ui::taskHandler() {
     // Poll after lv_timer_handler so we read the just-processed indev state.
     // После lv_timer_handler — читаем свежеобработанное состояние indev.
     poll_top_edge_swipe();
+    // EXEC-01D: apply the carousel switch requested by carousel_gesture_event_cb. Placed after
+    // lv_timer_handler() so LVGL has completely finished dispatching the gesture event before
+    // PageChain::goTo() is allowed to delete the (formerly active) screen root. Clearing the
+    // request before the call keeps it consumed even if goTo() early-returns.
+    // EXEC-01D: применяем отложенное переключение карусели — уже вне диспетчеризации событий
+    // LVGL, поэтому goTo() может безопасно удалить прежний активный экран.
+    if (s_deferred_carousel_dir != LV_DIR_NONE) {
+        const lv_dir_t dir = s_deferred_carousel_dir;
+        s_deferred_carousel_dir = LV_DIR_NONE;
+        map_horizontal_gesture_to_carousel(dir);
+    }
+    // A completed screen load can be reported from inside LVGL event dispatch. Keep the event
+    // callback side-effect free; request the Display-owned, next-VSYNC restart only after dispatch.
+    // Завершение загрузки приходит из LVGL callback; сам запрос делаем только после dispatch.
+    const bool transition_resync = s_page_chain.takeCompletedTransitionRgbResyncRequest();
 #if LV_USE_PERF_MONITOR
-    repositionBuiltinLvglPerfMonitorOnce();
+    // L1-B: scan only while ON and presentation is still pending (armed by applyPerformanceMonitorState).
+    // L1-B: скан только при ON, пока стиль не применён (взводит applyPerformanceMonitorState).
+    if (s_perf_lookup_pending) {
+        repositionBuiltinLvglPerfMonitorOnce();
+    }
 #endif
+    // Slice 6C: consume runtime recovery only when this iteration had no further relevant
+    // display/asset work. A busy iteration keeps the pending flag (coalesce) and folds any
+    // SCREEN_LOADED transition resync into that later redraw → RGB restart. Transition-only
+    // (no runtime pending) keeps the proven no-extra-refr_now path.
+    // Слайс 6C: recovery только на спокойной итерации. Busy оставляет pending и забирает
+    // переходный resync в поздний redraw→restart. Transition-only без runtime pending — как раньше.
+    // S6-THEME-01: run at most one heavy Theme transaction, for the newest request only.
+    // Gate: pending, quiet window elapsed, not already applying, and the display owes no
+    // recovery and did no busy work this iteration — the same "quiet iteration" the
+    // Repair-E block below uses. applyThemePresetNow() then marks recovery + batch busy,
+    // so the block below defers the redraw to the next quiet iteration, exactly as a
+    // normal Repair-E debt would.
+    // S6-THEME-01: не более одной тяжёлой транзакции темы, только для последнего запроса.
+    // Условие: есть pending, окно тишины истекло, применение не идёт, дисплей не должен
+    // восстановление и на этой итерации не был занят — та же «спокойная итерация», что и
+    // у блока Repair-E ниже. applyThemePresetNow() затем ставит recovery + batch busy,
+    // поэтому перерисовка уедет на следующую спокойную итерацию, как обычный долг Repair-E.
+    if (s_theme_apply_pending && !s_theme_apply_in_progress &&
+        !s_runtime_rgb_recovery_pending && !s_runtime_recovery_batch_busy &&
+        (uint32_t)(millis() - s_theme_request_ms) >= kThemeApplyQuietMs) {
+        const ThemePreset target = s_theme_requested;
+        s_theme_apply_pending = false;
+        // Same-preset burst (e.g. Dark → Light → Dark) needs no LVGL work and no flash
+        // write. onCustomThemeFileUpdated() owns the separate same-preset force-refresh
+        // contract, so nothing depends on a redundant reapply here.
+        // Серия, вернувшаяся к текущей теме, не требует ни работы LVGL, ни записи во flash.
+        // Контракт принудительного refresh для той же темы принадлежит
+        // onCustomThemeFileUpdated(), поэтому лишний reapply здесь никому не нужен.
+        if (target != s_theme_applied) {
+            s_theme_apply_in_progress = true;
+            applyThemePresetNow(target);
+            s_theme_applied = target;
+            s_theme_apply_in_progress = false;
+            // A request that landed during the apply re-arms pending for the newest value.
+            // Запрос, пришедший во время применения, пере-взводит pending для нового значения.
+            if (s_theme_requested != s_theme_applied) {
+                s_theme_apply_pending = true;
+                s_theme_request_ms    = millis();
+            }
+        }
+    }
+
+    const bool batch_busy = s_runtime_recovery_batch_busy;
+    s_runtime_recovery_batch_busy = false;
+    if (s_runtime_rgb_recovery_pending && batch_busy) {
+        (void)transition_resync; // folded into pending runtime recovery / схлопнуто в pending
+        return;
+    }
+    const bool runtime_resync = s_runtime_rgb_recovery_pending;
+    s_runtime_rgb_recovery_pending = false;
+    if (runtime_resync) {
+        (void)tryRedrawActiveScreenNow();
+    }
+    if (transition_resync || runtime_resync) {
+        display.requestRgbResync();
+    }
 }
 
 // 8-E19B: createTestOverlay triggers initial PageChain registration (DspTask / init only).
@@ -621,6 +866,25 @@ void lvgl_ui::refreshMainScreenFromSettings(bool force_full_redraw) {
         lv_obj_invalidate(lv_scr_act());
         lv_refr_now(NULL);
     }
+}
+
+bool lvgl_ui::tryRedrawActiveScreenNow() {
+    // s_disp is set only after initDisplayDriver — the existing readiness gate.
+    // s_disp появляется только после initDisplayDriver — существующий гейт готовности.
+    if (!s_disp) return false;
+    lv_obj_t* scr = lv_scr_act();
+    if (!scr) return false;
+    lv_obj_invalidate(scr);
+    lv_refr_now(NULL);
+    return true;
+}
+
+void lvgl_ui::requestRuntimeRgbRecovery() {
+    s_runtime_rgb_recovery_pending = true;
+}
+
+void lvgl_ui::noteDisplayBatchBusy() {
+    s_runtime_recovery_batch_busy = true;
 }
 
 // 8-E19B: LVGL-only mode routing — direct PageChain/overlay dispatch, no backend selection.
@@ -688,6 +952,9 @@ bool lvgl_ui::isLvglBootActive() {
 
 bool lvgl_ui::tryPresentLvglBootOnFirstDspLoop() {
     if (!lv_disp_get_default()) return false;
+    // FontProvider owns both the embedded TinyTTF primary and the independent
+    // compiled emergency face. Initialize on the LVGL task before Boot labels.
+    (void)FontProvider::begin();
     ensurePageChainRegistered();
     s_page_chain.showBoot(&s_boot_screen);
     s_lvgl_boot_active = true;
@@ -712,11 +979,86 @@ void lvgl_ui::dismissBootForWifiRecoveryHandoff() {
 
 bool lvgl_ui::dismissBootForMainHandoffWhenDue() {
     if (!s_lvgl_boot_active) return true;
-    if ((uint32_t)(millis() - s_lvgl_boot_shown_ms) < kLvglBootMinVisibleMs) return false;
+    if (!s_main_bg_boot_prepare_done) return false;
+    if (s_main_bg_loading_shown_ms != 0 &&
+        (uint32_t)(millis() - s_main_bg_loading_shown_ms) < kBootLoadingMinVisibleMs) {
+        return false;
+    }
     overlayHideAll();
     s_page_chain.dismissBoot();
     s_lvgl_boot_active = false;
     return true;
+}
+
+// Boot background preparation runs on the existing MainBgJpeg worker, never inline on DspTask:
+// lv_timer_handler() has a single call site (taskHandler()), so a synchronous decode here would
+// hold DspTask outside it for the whole decode/scale and freeze the Boot shuttle animation.
+// One phase per DspTask iteration; the loop keeps servicing LVGL between them.
+// Подготовка фона Boot идёт на существующем worker'е MainBgJpeg, а не на DspTask: у
+// lv_timer_handler() одна точка вызова (taskHandler()), и синхронный декод заморозил бы бегунок Boot.
+// По одной фазе на итерацию; между ними цикл продолжает обслуживать LVGL.
+void lvgl_ui::bootPrepareActiveMainBackgroundIfNeeded() {
+    if (s_main_bg_boot_prepare_done) return;
+
+    // Phase 0: show the status text and let one frame paint it before any work starts.
+    // Фаза 0: показать статус и дать кадру отрисоваться до начала работы.
+    if (!s_main_bg_boot_status_shown) {
+        bootScreenSetStatusUtf8(i18n::text(i18n::TextId::BootLoadingBackground));
+        s_main_bg_boot_status_shown = true;
+        s_main_bg_loading_shown_ms = millis();
+        return;
+    }
+
+    // Phase 1: request the applied preset's background. yoradio_theme_init() runs inside
+    // Display::init() before DspTask is created, so the active preset is already authoritative
+    // here — the slot comes from the Theme, never inferred from a path string.
+    // Фаза 1: запросить фон применённого пресета. Тема инициализируется в Display::init()
+    // до создания DspTask, поэтому слот берём из Темы, а не из строки пути.
+    if (!s_main_bg_boot_request_issued) {
+        uint8_t slot = static_cast<uint8_t>(yoradio_theme_active_preset());
+        if (slot > 2) slot = 0;
+        mainBgCacheRequestAsync(mainBgResolvedJpegPathForSlot(slot));
+        s_main_bg_boot_request_issued = true;
+        return;
+    }
+
+    // Phase 2: settlement. mainBgCacheRequestAsync() arms s_runtime_busy inside the same critical
+    // section as the generation bump, so once a request was issued busy==false means the attempt
+    // finished: installed by mainBgPollRuntimeApply() (success), dropped by the worker (total
+    // failure), or never accepted (void API early-return leaves busy clear). Boot never touches
+    // mainBgCachePollApply() itself — mainBgPollRuntimeApply() stays the sole consumer, and because
+    // it runs later in the same Display::loop() the cache is always published one iteration before
+    // prepare_done. Same contract as the old synchronous path: "attempt settled", not "background
+    // exists" — a total failure still lets Main continue, exactly as before.
+    // Фаза 2: завершение. busy==false после выданного запроса = попытка завершена (успех —
+    // кэш уже поставлен общим poll; неудача — worker сбросил busy; запрос не принят — busy не взводился).
+    // Boot не вызывает mainBgCachePollApply() — единственный потребитель остаётся mainBgPollRuntimeApply().
+    // Семантика прежняя: «попытка завершена», а не «фон есть».
+    if (mainBgCacheRuntimeBusy()) return;
+
+    // Existing DisplayPort RGB resync (VSYNC-coalesced). Do not invent a panel reset.
+    // Существующий resync DisplayPort (схлопывается на VSYNC). Новый reset панели не делаем.
+    display.requestRgbResync();
+    s_main_bg_boot_prepare_done = true;
+}
+
+void lvgl_ui::mainBgPollRuntimeApply() {
+    if (!mainBgCachePollApply()) return;
+    if (s_main_screen.refreshBackgroundFromCache()) {
+        Serial.println("[MAIN_BG] Applied to Main");
+        // Repair D + E: keep the accepted stable-frame redraw; defer the RGB restart until
+        // after this DspTask iteration's lv_timer_handler (post-dispatch barrier).
+        // Repair D + E: стабильный кадр оставляем; RGB restart — после lv_timer_handler итерации.
+        (void)tryRedrawActiveScreenNow();
+        requestRuntimeRgbRecovery();
+        noteDisplayBatchBusy();
+    } else {
+        Serial.println("[MAIN_BG] Background cache ready; Main not active");
+    }
+}
+
+bool lvgl_ui::mainBgBootPrepareDone() {
+    return s_main_bg_boot_prepare_done;
 }
 
 bool lvgl_ui::isLvglBootMinDwellElapsed() {
@@ -946,24 +1288,29 @@ size_t lvgl_ui::appendDisplayDiag(char* out, size_t len, size_t offset, bool* tr
     append_line("lvgl.mem.used_pct: %u\n", (unsigned)mon.used_pct);
     append_line("lvgl.mem.frag_pct: %u\n", (unsigned)mon.frag_pct);
 
-    append_line("lvgl.flush.full_refresh: %d\n", s_disp_drv.full_refresh ? 1 : 0);
-    append_line("lvgl.flush.direct_mode: %d\n", s_disp_drv.direct_mode ? 1 : 0);
+    // BASE-LVGL9-MIGRATION C2: no lv_disp_drv_t.full_refresh/direct_mode fields in v9 — derive the
+    // same diag keys from lv_display_get_render_mode() so the diag text contract is unchanged.
+    const lv_display_render_mode_t render_mode = lv_display_get_render_mode(s_disp);
+    append_line("lvgl.flush.full_refresh: %d\n", render_mode == LV_DISPLAY_RENDER_MODE_FULL ? 1 : 0);
+    append_line("lvgl.flush.direct_mode: %d\n", render_mode == LV_DISPLAY_RENDER_MODE_DIRECT ? 1 : 0);
 #if DSP_MODEL == DSP_ST7701
-    append_line("lvgl.flush_target: output_display_direct\n");
+    append_line("lvgl.flush_target: physical_display_direct\n");
 #else
     append_line("lvgl.flush_target: canvas_mark_dirty\n");
 #endif
-    if (s_disp_buf1 && s_disp_drv.hor_res > 0) {
+    const int32_t disp_hor_res = lv_display_get_horizontal_resolution(s_disp);
+    const int32_t disp_ver_res = lv_display_get_vertical_resolution(s_disp);
+    if (s_disp_buf1 && disp_hor_res > 0) {
 #if DSP_MODEL == DSP_ST7701
         if (s_disp_buf_partial_h > 0) {
             append_line("lvgl.draw_buf: partial_psram_single (%ux%u)\n",
-                        (unsigned)s_disp_drv.hor_res, (unsigned)s_disp_buf_partial_h);
+                        (unsigned)disp_hor_res, (unsigned)s_disp_buf_partial_h);
         } else {
             append_line("lvgl.draw_buf: partial_psram_single (uninitialized)\n");
         }
 #else
         append_line("lvgl.draw_buf: full_frame_psram_single (%ux%u)\n",
-                    (unsigned)s_disp_drv.hor_res, (unsigned)s_disp_drv.ver_res);
+                    (unsigned)disp_hor_res, (unsigned)disp_ver_res);
 #endif
     } else {
         append_line("lvgl.draw_buf: unknown\n");

@@ -24,12 +24,17 @@
 #include "../core/ppm_pcm_telemetry.h"
 #endif
 #include "AudioEx.h"
+#include "audio_text_url_utils.h"
 #include "aac_decoder/aac_decoder.h"
 #include "flac_decoder/flac_decoder.h"
 #include "mp3_decoder/mp3_decoder.h"
 #include "opus_decoder/opus_decoder.h"
 #include "vorbis_decoder/vorbis_decoder.h"
 #include "psram_unique_ptr.hpp"
+#if defined(YORADIO_IDF_C1_CONFIG) && YORADIO_IDF_C1_CONFIG
+#include <esp_heap_caps.h>
+#include <mbedtls/esp_mbedtls_dynamic.h>
+#endif
 
 // constants
 constexpr size_t    m_frameSizeWav       = 4096;
@@ -46,6 +51,108 @@ constexpr size_t    AUDIO_STACK_SIZE     = 3300;
 // static allocations for Audio task
 StaticTask_t __attribute__((unused)) xAudioTaskBuffer;
 StackType_t  __attribute__((unused)) xAudioStack[AUDIO_STACK_SIZE];
+
+#if defined(YORADIO_IDF_C1_CONFIG) && YORADIO_IDF_C1_CONFIG
+namespace {
+struct AudioTlsDynamicBufferHeader {
+    uint32_t state;
+    uint32_t len;
+};
+
+struct AudioTlsHeapProbe {
+    const void* target;
+    size_t      size;
+    bool        found;
+};
+
+enum class AudioAacStaticRxResult : int8_t {
+    FAILED = -1,
+    SKIPPED = 0,
+    ENABLED = 1
+};
+
+constexpr uint32_t AUDIO_TLS_BUF_NO_CACHED = 1;
+constexpr uint32_t AUDIO_TLS_BUF_STATIC = 2;
+constexpr uint32_t AUDIO_TLS_CACHE_BYTES = 16;
+constexpr uint32_t AUDIO_TLS_STATIC_RX_ALLOC_BYTES = 17058;
+#if defined(CONFIG_HEAP_POISONING_LIGHT) || defined(CONFIG_HEAP_POISONING_COMPREHENSIVE)
+constexpr size_t AUDIO_HEAP_USER_POINTER_OFFSET = 8;
+#else
+constexpr size_t AUDIO_HEAP_USER_POINTER_OFFSET = 4;
+#endif
+static_assert(sizeof(AudioTlsDynamicBufferHeader) == 8, "ESP-IDF dynamic TLS buffer header ABI changed");
+
+bool findAudioTlsHeapBlock(walker_heap_into_t, walker_block_info_t block, void* userData) {
+    auto* probe = static_cast<AudioTlsHeapProbe*>(userData);
+    const auto* blockUserPtr = static_cast<const uint8_t*>(block.ptr) + AUDIO_HEAP_USER_POINTER_OFFSET;
+    if(block.used && blockUserPtr == probe->target) {
+        probe->size = block.size > AUDIO_HEAP_USER_POINTER_OFFSET
+            ? block.size - AUDIO_HEAP_USER_POINTER_OFFSET
+            : 0;
+        probe->found = true;
+        return false;
+    }
+    return true;
+}
+
+AudioAacStaticRxResult enableAudioAacStaticRx(AudioNetworkClientSecure& client) {
+    mbedtls_ssl_context* ssl = client.audioSslContext();
+    if(!ssl) {
+        Serial.println("[AUDIO.TLS] AAC static RX skipped unsafe_cache reason=no_context");
+        return AudioAacStaticRxResult::SKIPPED;
+    }
+
+    unsigned char* inBuf = ssl->MBEDTLS_PRIVATE(in_buf);
+    if(!inBuf) {
+        Serial.println("[AUDIO.TLS] AAC static RX skipped unsafe_cache reason=no_rx_buffer");
+        return AudioAacStaticRxResult::SKIPPED;
+    }
+
+    auto* headerPtr = reinterpret_cast<AudioTlsDynamicBufferHeader*>(
+        inBuf - sizeof(AudioTlsDynamicBufferHeader));
+    AudioTlsHeapProbe probe{headerPtr, 0, false};
+    heap_caps_walk(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT, findAudioTlsHeapBlock, &probe);
+    if(!probe.found || probe.size < sizeof(AudioTlsDynamicBufferHeader) + AUDIO_TLS_CACHE_BYTES) {
+        Serial.printf("[AUDIO.TLS] AAC static RX skipped unsafe_cache reason=unverified_block found=%u size=%lu heap_user_offset=%u\n",
+                      (unsigned)probe.found,
+                      (unsigned long)probe.size,
+                      (unsigned)AUDIO_HEAP_USER_POINTER_OFFSET);
+        return AudioAacStaticRxResult::SKIPPED;
+    }
+
+    AudioTlsDynamicBufferHeader header{};
+    memcpy(&header, headerPtr, sizeof(header));
+    if(header.state == AUDIO_TLS_BUF_STATIC) {
+        Serial.printf("[AUDIO.TLS] AAC static RX already enabled bytes=%lu\n",
+                      (unsigned long)header.len);
+        return AudioAacStaticRxResult::ENABLED;
+    }
+    if(header.state != AUDIO_TLS_BUF_NO_CACHED || header.len != AUDIO_TLS_CACHE_BYTES) {
+        Serial.printf("[AUDIO.TLS] AAC static RX skipped unsafe_cache reason=unexpected_header state=%lu len=%lu\n",
+                      (unsigned long)header.state,
+                      (unsigned long)header.len);
+        return AudioAacStaticRxResult::SKIPPED;
+    }
+
+    const esp_err_t err = esp_mbedtls_dynamic_set_rx_buf_static(ssl);
+    if(err != ESP_OK) {
+        Serial.printf("[AUDIO.TLS] AAC static RX failed err=%d alloc=%lu internal_free=%lu internal_largest=%lu\n",
+                      (int)err,
+                      (unsigned long)AUDIO_TLS_STATIC_RX_ALLOC_BYTES,
+                      (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                      (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+        return AudioAacStaticRxResult::FAILED;
+    }
+
+    Serial.printf("[AUDIO.TLS] AAC static RX enabled version=%s alloc=%lu internal_free=%lu internal_largest=%lu\n",
+                  mbedtls_ssl_get_version(ssl),
+                  (unsigned long)AUDIO_TLS_STATIC_RX_ALLOC_BYTES,
+                  (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                  (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+    return AudioAacStaticRxResult::ENABLED;
+}
+}
+#endif
 
 template <typename... Args>
 void AUDIO_INFO(const char* fmt, Args&&... args) {
@@ -354,6 +461,11 @@ void Audio::zeroI2Sbuff(){
 }
 //****************************************************************************************
 void Audio::setDefaults() {
+    // E-HO1: the audio task's world is about to be replaced - decoders freed, InBuff
+    // reset. Any request still in flight belongs to the stream that is going away.
+    // E-HO1: мир аудиозадачи сейчас заменится — декодеры освобождаются, InBuff
+    // сбрасывается. Любой запрос «в полёте» относится к уходящему потоку.
+    beginDecodeEpoch();
     stopSong();
     initInBuff(); // initialize InputBuffer if not already done
     InBuff.resetBuffer();
@@ -441,7 +553,7 @@ void Audio::setDefaults() {
     m_resampleCursor = 0.0f;
 }
 //****************************************************************************************
-void Audio::tlsPreconnectCleanup() {
+void Audio::tlsPreconnectCleanup(uint8_t preserveCodec) {
     // shrink_to_fit to reduce fragmentation before TLS connect
     if(m_playlistURL.size() > 1024) m_playlistURL.shrink_to_fit();
     if(m_playlistContent.size() > 1024) m_playlistContent.shrink_to_fit();
@@ -450,9 +562,25 @@ void Audio::tlsPreconnectCleanup() {
     if(m_hashQueue.size() > 1024) m_hashQueue.shrink_to_fit();
     if(m_linesWithURL.size() > 1024) m_linesWithURL.shrink_to_fit();
     if(m_linesWithEXTINF.size() > 1024) m_linesWithEXTINF.shrink_to_fit();
-    MP3Decoder_FreeBuffers();
+    // E-MP1: the preserved codec's decoder must stay allocated - the audio task is
+    // still decoding the retained buffer while this runs on the player task.
+    // E-MP1: декодер сохраняемого кодека остаётся выделенным — аудиозадача всё ещё
+    // декодирует удержанный буфер, пока это выполняется в задаче Player.
+    if(preserveCodec == CODEC_MP3) {
+        Serial.printf("[AUDIO.RETRY] TLS cleanup preserving MP3 decoder inbuf=%lu\n",
+                      (unsigned long)InBuff.bufferFilled());
+    }
+    else {
+        MP3Decoder_FreeBuffers();
+    }
     FLACDecoder_FreeBuffers();
-    AACDecoder_FreeBuffers();
+    if(preserveCodec == CODEC_AAC) {
+        Serial.printf("[AUDIO.RETRY] TLS cleanup preserving AAC decoder inbuf=%lu\n",
+                      (unsigned long)InBuff.bufferFilled());
+    }
+    else {
+        AACDecoder_FreeBuffers();
+    }
     OPUSDecoder_FreeBuffers();
     VORBISDecoder_FreeBuffers();
     delay(15); // let memory settle after freeing
@@ -602,56 +730,43 @@ bool Audio::openai_speech(const String& api_key, const String& model, const Stri
     return res;
 }
 //****************************************************************************************
+void Audio::applyExpectedFormatHints(const char* extension) {
+    m_expectedCodec = CODEC_NONE;
+    m_expectedPlsFmt = FORMAT_NONE;
+    if(!extension) return;
+
+    if(     audio_safe::endsWithIcase(extension, ".mp3"))    m_expectedCodec = CODEC_MP3;
+    else if(audio_safe::endsWithIcase(extension, ".aac"))    m_expectedCodec = CODEC_AAC;
+    else if(audio_safe::endsWithIcase(extension, ".aacp"))   m_expectedCodec = CODEC_AAC;
+    else if(audio_safe::endsWithIcase(extension, ".wav"))    m_expectedCodec = CODEC_WAV;
+    else if(audio_safe::endsWithIcase(extension, ".m4a"))    m_expectedCodec = CODEC_M4A;
+    else if(audio_safe::endsWithIcase(extension, ".flac"))   m_expectedCodec = CODEC_FLAC;
+    else if(audio_safe::endsWithIcase(extension, "-flac"))   m_expectedCodec = CODEC_FLAC;
+    else if(audio_safe::endsWithIcase(extension, ".vorbis") ||
+            audio_safe::endsWithIcase(extension, "/vorbis")) m_expectedCodec = CODEC_VORBIS;
+    else if(audio_safe::endsWithIcase(extension, ".opus") ||
+            audio_safe::endsWithIcase(extension, "/opus"))   m_expectedCodec = CODEC_OPUS;
+    else if(audio_safe::endsWithIcase(extension, ".ogg") ||
+            audio_safe::endsWithIcase(extension, "/ogg"))    m_expectedCodec = CODEC_OGG;
+
+    if(     audio_safe::endsWithIcase(extension, ".asx"))    m_expectedPlsFmt = FORMAT_ASX;
+    else if(audio_safe::endsWithIcase(extension, ".m3u"))    m_expectedPlsFmt = FORMAT_M3U;
+    else if(audio_safe::containsIcase(extension, ".m3u8"))   m_expectedPlsFmt = FORMAT_M3U8;
+    else if(audio_safe::endsWithIcase(extension, ".pls"))    m_expectedPlsFmt = FORMAT_PLS;
+}
+//****************************************************************************************
 audiolib::hwoe_t Audio::dismantle_host(const char* host){
-    if (!host) return {};
+    audiolib::hwoe_t result{};
+    const audio_safe::UrlParts parts = audio_safe::parseUrl(host);
+    if(!parts.valid) return result;   // result.valid stays false / признак ошибки сохраняется
 
-    audiolib::hwoe_t result;
-
-    const char* p = host;
-
-    // 🔐 1. SSL check
-    if (strncmp(p, "https://", 8) == 0) {
-        result.ssl = true;
-        p += 8;
-    } else if (strncmp(p, "http://", 7) == 0) {
-        result.ssl = false;
-        p += 7;
-    } else {  // No valid scheme -> error or acceptance http
-        result.ssl = false;
-    }
-
-    // ❓ 2. extract host (from p to ':' or '/' or '?')
-    const char* host_start = p;
-    const char* port_sep = strchr(p, ':');
-    const char* path_sep = strchr(p, '/');
-    const char* query_sep = strchr(p, '?');
-
-    const char* host_end = p + strlen(p);  // default: end of string
-    if (port_sep  && port_sep  < host_end) host_end = port_sep;
-    if (path_sep  && path_sep  < host_end) host_end = path_sep;
-    if (query_sep && query_sep < host_end) host_end = query_sep;
-    result.hwoe.copy_from(host_start, host_end - host_start);
-    result.rqh_host.clone_from(result.hwoe);
-
-    // ❓ 3. extract port
-    result.port = result.ssl ? 443 : 80; // default
-    if (port_sep && (!path_sep || port_sep < path_sep)) {
-        result.port = atoi(port_sep + 1);
-        result.rqh_host.appendf(":%u", result.port);
-    }
-
-    // ❓ 4. extract extension (path)
-    if (path_sep) {
-        const char* path_start = path_sep + 1;
-        const char* path_end = query_sep ? query_sep : host + strlen(host);
-        result.extension.copy_from(path_start, path_end - path_start);
-    }
-
-    // ❓ 5. extract query string
-    if (query_sep) {
-        result.query_string.assign(query_sep + 1);
-    }
-
+    result.valid = true;
+    result.ssl = parts.ssl;
+    result.port = parts.port;
+    result.hwoe.copy_from(parts.host, parts.hostLength);
+    result.rqh_host.copy_from(parts.authority, parts.authorityLength);
+    if(parts.path) result.extension.copy_from(parts.path, parts.pathLength);
+    if(parts.query) result.query_string.copy_from(parts.query, parts.queryLength);
     return result;
 }
 //****************************************************************************************
@@ -678,6 +793,19 @@ bool Audio::connecttohost(const char* host, const char* user, const char* pwd) {
     c_host.copy_from(host);
     c_host.trim();
     auto dismantledHost = dismantle_host(c_host.get());
+
+    // E-AT2: a malformed URL is a permanent input error, not a transient network
+    // failure — fail before setDefaults()/transport selection and do not issue a
+    // DNS/connect attempt that would be reported as "connection lost".
+    // E-AT2: некорректный URL — постоянная ошибка ввода, а не временный сетевой
+    // отказ: выходим до setDefaults()/выбора транспорта и не делаем сетевой
+    // попытки, которую потом приняли бы за "connection lost".
+    if(!dismantledHost.valid) {
+        AUDIO_ERROR("Invalid URL: %s", c_host.c_get());
+        stopSong();
+        xSemaphoreGiveRecursive(mutex_playAudioData);
+        return false;
+    }
 
 //  https://edge.live.mp3.mdn.newmedia.nacamar.net:8000/ps-charivariwb/livestream.mp3;?user=ps-charivariwb;&pwd=ps-charivariwb-------
 //      |   |                                     |    |                              |
@@ -743,35 +871,33 @@ bool Audio::connecttohost(const char* host, const char* user, const char* pwd) {
     if(m_f_ssl) tlsPreconnectCleanup();
     IPAddress resolvedIP;
     if(networkResolveHostForConnect(hwoe.get(), resolvedIP, m_f_ssl ? m_timeout_ms_ssl : m_timeout_ms)) {
-        res = m_client->connect(resolvedIP, port);
+        // E-AT3: resolver IP + original hostname for TLS / IP из resolver + hostname для TLS
+        res = audioTransportConnect(resolvedIP, port, hwoe.c_get(""));
     } else {
         res = false;
     }
 
-    m_expectedCodec = CODEC_NONE;
-    m_expectedPlsFmt = FORMAT_NONE;
+    applyExpectedFormatHints(nullptr);
 
     if(res) {
         uint32_t dt = millis() - timestamp;
         AUDIO_INFO("%s has been established in %lu ms", m_f_ssl ? "SSL" : "Connection", (long unsigned int)dt);
+    }
+#if defined(YORADIO_IDF_C1_CONFIG) && YORADIO_IDF_C1_CONFIG
+    if(res && m_f_ssl &&
+       (extension.ends_with_icase(".aac") || extension.ends_with_icase(".aacp"))) {
+        const AudioAacStaticRxResult staticRx = enableAudioAacStaticRx(clientsecure);
+        if(staticRx == AudioAacStaticRxResult::FAILED) {
+            clientsecure.stop();
+            res = false;
+        }
+    }
+#endif
+
+    if(res) {
         m_f_running = true;
         m_client->print(rqh.get());
-        if(extension.ends_with_icase( ".mp3" ))      m_expectedCodec  = CODEC_MP3;
-        if(extension.ends_with_icase( ".aac" ))      m_expectedCodec  = CODEC_AAC;
-        if(extension.ends_with_icase( ".aacp" )) m_expectedCodec  = CODEC_AAC;
-        if(extension.ends_with_icase( ".wav" ))      m_expectedCodec  = CODEC_WAV;
-        if(extension.ends_with_icase( ".m4a" ))      m_expectedCodec  = CODEC_M4A;
-        if(extension.ends_with_icase( ".ogg" ))      m_expectedCodec  = CODEC_OGG;
-        if(extension.ends_with_icase( ".vorbis"))   m_expectedCodec = CODEC_VORBIS;
-        if(extension.ends_with_icase( "/vorbis"))   m_expectedCodec = CODEC_VORBIS;
-        if(extension.ends_with_icase( ".flac"))      m_expectedCodec  = CODEC_FLAC;
-        if(extension.ends_with_icase( "-flac"))      m_expectedCodec  = CODEC_FLAC;
-        if(extension.ends_with_icase( ".opus"))      m_expectedCodec  = CODEC_OPUS;
-        if(extension.ends_with_icase( "/opus"))      m_expectedCodec  = CODEC_OPUS;
-        if(extension.ends_with_icase( ".asx" ))      m_expectedPlsFmt = FORMAT_ASX;
-        if(extension.ends_with_icase( ".m3u" ))      m_expectedPlsFmt = FORMAT_M3U;
-        if(extension.ends_with_icase( ".pls" ))      m_expectedPlsFmt = FORMAT_PLS;
-        if(extension.contains(".m3u8"))              m_expectedPlsFmt = FORMAT_M3U8;
+        applyExpectedFormatHints(extension.c_get());
 
         m_currentHost.clone_from(c_host);
         m_lastHost.clone_from(c_host);
@@ -800,6 +926,20 @@ bool Audio::connecttohost(const char* host, const char* user, const char* pwd) {
     return res;
 }
 //****************************************************************************************
+// E-AT3: the project resolves DNS itself, so the plain path keeps connect(ip, port)
+// while the TLS path uses the core overload that also carries the hostname.
+// Passing the IP alone makes mbedtls use ip.toString() as SNI, which is not the
+// stream's hostname. A literal-IP URL behaves exactly as before, because the
+// hostname then *is* the IP string.
+// E-AT3: DNS резолвится проектом, поэтому обычный путь сохраняет connect(ip, port),
+// а TLS использует overload ядра, принимающий ещё и hostname. Передача одного IP
+// заставляет mbedtls подставлять ip.toString() в SNI. Для URL с буквальным IP
+// поведение не меняется — hostname и есть строка IP.
+bool Audio::audioTransportConnect(const IPAddress& ip, uint16_t port, const char* hostname) {
+    if(m_f_ssl) return clientsecure.connectWithSni(ip, port, hostname) > 0;
+    return m_client->connect(ip, port) > 0;
+}
+//****************************************************************************************
 bool Audio::httpPrint(const char* host) {
     // user and pwd for authentification only, can be empty
     if(!m_f_running) return false;
@@ -813,11 +953,30 @@ bool Audio::httpPrint(const char* host) {
     ps_ptr<char> query_string; // parameter
     ps_ptr<char> path;         // extension + '?' + parameter
     ps_ptr<char> rqh;          // request header
-    ps_ptr<char> cur_hwoe;     // m_currenthost without extension
 
     c_host.copy_from(host);
     c_host.trim();
     auto dismantledHost = dismantle_host(c_host.get());
+
+    // E-AT2: reject a malformed URL before the live transport is closed and
+    // before a request is built from empty fields.
+    // E-AT2: отвергаем некорректный URL до закрытия текущего транспорта и до
+    // сборки запроса из пустых полей.
+    if(!dismantledHost.valid) {
+        AUDIO_ERROR("Invalid URL: %s", c_host.c_get());
+        if(m_f_preserveStreamReconnect) return false;
+        stopSong();
+        return false;
+    }
+
+    // E-AT1: endpoint identity of the previous URL is read here, before m_f_ssl
+    // and the port/host locals below are overwritten with the new URL.
+    // A socket may be reused only for the same hostname + scheme + effective port.
+    // E-AT1: старый endpoint читается здесь, до перезаписи m_f_ssl и локальных
+    // полей новым URL. Сокет переиспользуется только при совпадении hostname,
+    // схемы и эффективного порта.
+    if(!m_currentHost.valid()) m_currentHost.assign("");
+    const bool f_equal = audio_safe::sameHttpEndpoint(c_host.c_get(""), m_currentHost.c_get(""));
 
 //  https://edge.live.mp3.mdn.newmedia.nacamar.net:8000/ps-charivariwb/livestream.mp3;?user=ps-charivariwb;&pwd=ps-charivariwb-------
 //      |   |                                     |    |                              |
@@ -841,13 +1000,9 @@ bool Audio::httpPrint(const char* host) {
 
     path = urlencode(path.get(), true);
 
-    if(!m_currentHost.valid()) m_currentHost.assign("");
-    auto dismantledLastHost = dismantle_host(m_currentHost.get());
-    cur_hwoe.clone_from(dismantledLastHost.hwoe);
-
-    bool f_equal = true;
-    if(hwoe.equals(cur_hwoe)){f_equal = true;}
-    else{                     f_equal = false;}
+#if defined(YORADIO_IDF_C1_CONFIG) && YORADIO_IDF_C1_CONFIG
+    bool openedTlsNow = false;
+#endif
 
     rqh.assign("GET /");
     rqh.append(path.get());
@@ -870,47 +1025,59 @@ bool Audio::httpPrint(const char* host) {
          else        { m_client = static_cast<NetworkClient*>(&client); }
         if(f_equal) AUDIO_INFO("The host has disconnected, reconnecting");
 
-        if(m_f_ssl) tlsPreconnectCleanup();
+        const uint8_t preserveCodec = m_f_preserveStreamReconnect
+                                      ? m_preservedStreamCodec
+                                      : (uint8_t)CODEC_NONE;   // E-MP1
+        if(m_f_ssl) tlsPreconnectCleanup(preserveCodec);
         IPAddress resolvedIP;
+        // E-AT3: resolver IP + original hostname for TLS / IP из resolver + hostname для TLS
         if(!networkResolveHostForConnect(hwoe.get(), resolvedIP, m_f_ssl ? m_timeout_ms_ssl : m_timeout_ms) ||
-           !m_client->connect(resolvedIP, port)) {
+           !audioTransportConnect(resolvedIP, port, hwoe.c_get(""))) {
             AUDIO_ERROR("connection lost %s", c_host.c_get());
 #ifdef MEM_WATCHDOG_AUTOREBOOT
             memWatchdog.record(MWEvent::CONN_LOST);
             { auto d = memWatchdog.evaluate(); if (d.trigger) memWatchdog.armReboot(); }
 #endif
+            if(m_f_preserveStreamReconnect) return false;
+            stopSong();
+            return false;
+        }
+#if defined(YORADIO_IDF_C1_CONFIG) && YORADIO_IDF_C1_CONFIG
+        openedTlsNow = m_f_ssl;
+#endif
+    }
+#if defined(YORADIO_IDF_C1_CONFIG) && YORADIO_IDF_C1_CONFIG
+    if(openedTlsNow &&
+       (extension.ends_with_icase(".aac") || extension.ends_with_icase(".aacp"))) {
+        const AudioAacStaticRxResult staticRx = enableAudioAacStaticRx(clientsecure);
+        if(staticRx == AudioAacStaticRxResult::FAILED) {
+            clientsecure.stop();
+            AUDIO_ERROR("AAC static TLS RX allocation failed");
+            if(m_f_preserveStreamReconnect) return false;
             stopSong();
             return false;
         }
     }
+#endif
     m_currentHost.clone_from(c_host);
     m_client->print(rqh.get());
 
-    if(     extension.ends_with_icase(".mp3"))       m_expectedCodec  = CODEC_MP3;
-    else if(extension.ends_with_icase(".aac"))       m_expectedCodec  = CODEC_AAC;
-    else if(extension.ends_with_icase(".aacp"))       m_expectedCodec  = CODEC_AAC;
-    else if(extension.ends_with_icase(".wav"))       m_expectedCodec  = CODEC_WAV;
-    else if(extension.ends_with_icase(".m4a"))       m_expectedCodec  = CODEC_M4A;
-    else if(extension.ends_with_icase(".flac"))      m_expectedCodec  = CODEC_FLAC;
-    else if(extension.ends_with_icase("-flac"))   m_expectedCodec = CODEC_FLAC;
-    else if(extension.ends_with_icase(".vorbis"))   m_expectedCodec = CODEC_VORBIS;
-    else if(extension.ends_with_icase("/vorbis"))   m_expectedCodec = CODEC_VORBIS;
-    else if(extension.ends_with_icase(".opus"))   m_expectedCodec = CODEC_OPUS;
-    else if(extension.ends_with_icase("/opus"))   m_expectedCodec = CODEC_OPUS;
-    else if(extension.ends_with_icase(".ogg" ))   m_expectedCodec = CODEC_OGG;
-    else if(extension.ends_with_icase("/ogg" ))   m_expectedCodec = CODEC_OGG;
-    else                                             m_expectedCodec  = CODEC_NONE;
-
-    if(     extension.ends_with_icase(".asx"))       m_expectedPlsFmt = FORMAT_ASX;
-    else if(extension.ends_with_icase(".m3u"))       m_expectedPlsFmt = FORMAT_M3U;
-    else if(extension.contains(".m3u8"))             m_expectedPlsFmt = FORMAT_M3U8;
-    else if(extension.ends_with_icase(".pls"))       m_expectedPlsFmt = FORMAT_PLS;
-    else                                             m_expectedPlsFmt = FORMAT_NONE;
+    applyExpectedFormatHints(extension.c_get());
 
     m_audioFileSize = 0;
     m_dataMode = HTTP_RESPONSE_HEADER; // Handle header
     m_streamType = ST_WEBSTREAM;
+    m_f_metadata = false;
+    m_metaint = 0;
+    m_metacount = 0;
+    m_f_firstmetabyte = false;
     m_f_chunked = false;
+    m_chunkcount = 0;
+    m_pwst.chunkSize = 0;
+    m_pwst.readedBytes = 0;
+    m_rmet.pos_ml = 0;
+    m_rmet.metaDataSize = 0;
+    m_rmet.res = 0;
     /*AUDIO_LOG_DEBUG*/AUDIO_INFO("playlistFormat %s, dataMode %s, streamType: %s", plsFmtStr[m_playlistFormat], dataModeStr[m_dataMode], streamTypeStr[m_streamType]);
     return true;
 }
@@ -933,6 +1100,16 @@ bool Audio::httpRange(uint32_t seek, uint32_t length){
     c_host.clone_from(m_currentHost);
     c_host.trim();
     auto dismantledHost = dismantle_host(c_host.get());
+
+    // E-AT2: same contract as httpPrint()/connecttohost() — no transport work,
+    // no cleanup and no request on a URL that did not parse.
+    // E-AT2: тот же контракт — без работы с транспортом, cleanup и запроса,
+    // если URL не разобран.
+    if(!dismantledHost.valid) {
+        AUDIO_ERROR("Invalid URL: %s", c_host.c_get());
+        stopSong();
+        return false;
+    }
 
 //  https://edge.live.mp3.mdn.newmedia.nacamar.net:8000/ps-charivariwb/livestream.mp3;?user=ps-charivariwb;&pwd=ps-charivariwb-------
 //      |   |                                     |    |                              |
@@ -980,8 +1157,9 @@ bool Audio::httpRange(uint32_t seek, uint32_t length){
 
     if(m_f_ssl) tlsPreconnectCleanup();
     IPAddress resolvedIP;
+    // E-AT3: resolver IP + original hostname for TLS / IP из resolver + hostname для TLS
     if(!networkResolveHostForConnect(hwoe.get(), resolvedIP, m_f_ssl ? m_timeout_ms_ssl : m_timeout_ms) ||
-       !m_client->connect(resolvedIP, port)) {
+       !audioTransportConnect(resolvedIP, port, hwoe.c_get(""))) {
         AUDIO_ERROR("connection lost %s", c_host.c_get());
 #ifdef MEM_WATCHDOG_AUTOREBOOT
         memWatchdog.record(MWEvent::CONN_LOST);
@@ -1228,77 +1406,31 @@ void Audio::showID3Tag(const char* tag, const char* value) {
 }
 //****************************************************************************************
 void Audio::latinToUTF8(ps_ptr<char>& buff, bool UTF8check) {
-    // most stations send  strings in UTF-8 but a few sends in latin. To standardize this, all latin strings are
-    // converted to UTF-8. If UTF-8 is already present, nothing is done and true is returned.
-    // A conversion to UTF-8 extends the string. Therefore it is necessary to know the buffer size. If the converted
-    // string does not fit into the buffer, false is returned
+    // Most stations send UTF-8, but the historical fallback treats every invalid sequence as Latin-1.
+    // Большинство станций шлёт UTF-8, но исторический fallback трактует любую invalid sequence как Latin-1.
+    // This is not encoding detection: damaged UTF-8 can therefore become valid Latin-1 text. Strict metadata
+    // validation happens later at the callback boundary and cannot recover the original encoding.
+    // Это не определение кодировки: повреждённый UTF-8 может стать допустимым Latin-1-текстом. Строгая
+    // metadata-проверка выполняется позже, на callback boundary, и не восстанавливает исходную кодировку.
 
-    uint16_t pos = 0;
-    uint16_t in = 0;
-    uint16_t out = 0;
-    bool     isUTF8 = true;
+    if(!buff.valid()) return;
+    if(UTF8check && audio_safe::isValidUtf8(buff.c_get())) return;
 
-    // We cannot detect if a given string (or byte sequence) is a UTF-8 encoded text as for example each and every series
-    // of UTF-8 octets is also a valid (if nonsensical) series of Latin-1 (or some other encoding) octets.
-    // However not every series of valid Latin-1 octets are valid UTF-8 series. So you can rule out strings that do not conform
-    // to the UTF-8 encoding schema:
-
-    if (UTF8check) {
-        while (buff[pos] != '\0') {
-            if (buff[pos] <= 0x7F) {// 0xxxxxxx: ASCII
-                pos++;
-            }
-            else if ((buff[pos] & 0xE0) == 0xC0) {
-                if (pos + 1 >= buff.strlen()) isUTF8 = false;
-                // 110xxxxx 10xxxxxx: 2-byte
-                if ((buff[pos + 1] & 0xC0) != 0x80) isUTF8 = false;
-                if (buff[pos] < 0xC2) isUTF8 = false; // Overlong encoding
-                pos += 2;
-            }
-            else if  ((buff[pos] & 0xF0) == 0xE0) {
-                // 1110xxxx 10xxxxxx 10xxxxxx: 3-byte
-                if ((buff[pos + 1] & 0xC0) != 0x80 || (buff[pos + 2] & 0xC0) != 0x80) isUTF8 = false;
-                if (buff[pos] == 0xE0 && buff[pos + 1 ] < 0xA0) isUTF8 = false; // Overlong
-                if (buff[pos] == 0xED && buff[pos + 1] >= 0xA0) isUTF8 = false; // UTF-16 surrogate
-                pos += 3;
-            }
-            else if ((buff[pos] & 0xF8) == 0xF0) {
-                // 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx: 4-byte
-                if ((buff[pos + 1] & 0xC0) != 0x80 ||
-                    (buff[pos + 2] & 0xC0) != 0x80 ||
-                    (buff[pos + 3] & 0xC0) != 0x80) isUTF8 = false;
-                if (buff[pos] == 0xF0 && buff[pos + 1] < 0x90) isUTF8 = false; // Overlong
-                if (buff[pos] > 0xF4 || (buff[pos] == 0xF4 && buff[pos + 1] > 0x8F)) isUTF8 = false; // > U+10FFFF
-                pos += 4;
-            }
-            else{
-                isUTF8 = false; // Invalid first byte
-            }
-            if(!isUTF8)break;
-        }
-        if (isUTF8) return; // is UTF-8, do nothing
-    }
     ps_ptr<char> iso8859_1("iso8859_1");
-    iso8859_1.assign(buff.get());
+    iso8859_1.assign(buff.c_get());
+    if(!iso8859_1.valid()) return;
 
     // Worst-case: all chars are latin1 > 0x7F became 2 Bytes → max length is twice +1
-    std::size_t requiredSize = strlen(iso8859_1.get()) * 2 + 1;
+    const size_t sourceLength = iso8859_1.strlen();
+    if(sourceLength > (SIZE_MAX - 1) / 2) return;
+    const size_t requiredSize = sourceLength * 2 + 1;
 
     if (buff.size() < requiredSize) {
         buff.realloc(requiredSize);
+        if(!buff.valid() || buff.size() < requiredSize) return;
     }
 
-    // coding into UTF-8
-    while (iso8859_1[in] != '\0') {
-        if (iso8859_1[in] < 0x80) {
-            buff[out++] = iso8859_1[in++];
-        } else {
-            buff[out++] = (0xC0 | (iso8859_1[in] >> 6));
-            buff[out++] = (0x80 | (iso8859_1[in] & 0x3F));
-            in++;
-        }
-    }
-    buff[out] = '\0';
+    audio_safe::latin1ToUtf8(iso8859_1.c_get(), buff.get(), buff.size());
 }
 //****************************************************************************************
 void Audio::htmlToUTF8(char* str) { // convert HTML to UTF-8
@@ -3057,6 +3189,10 @@ size_t Audio::process_m3u8_ID3_Header(uint8_t* packet) {
 }
 //****************************************************************************************
 uint32_t Audio::stopSong() {
+    clearBufferedReconnectPcmWatch();
+    resetAacOverlapDiagnostic(true);
+    m_f_preserveStreamReconnect = false;
+    m_preservedStreamCodec = CODEC_NONE;
     m_f_lockInBuffer = true; // wait for the decoding to finish
         uint8_t maxWait = 0;
         while(m_f_audioTaskIsDecoding) {vTaskDelay(1); maxWait++; if(maxWait > 100) break;} // in case of error wait max 100ms
@@ -3095,6 +3231,14 @@ uint32_t Audio::stopSong() {
 //****************************************************************************************
 // E36REC1B: unstable-stream session — Player-owned reset, Audio-owned budget / сессия unstable
 void Audio::beginPlaybackSession() {
+    m_playbackSession++;
+    if (!m_playbackSession) m_playbackSession = 1;
+    resetAacOverlapDiagnostic(true);
+    m_f_webstreamReconnectPending = false;
+    m_f_preserveStreamReconnect = false;
+    m_preservedStreamCodec = CODEC_NONE;
+    m_webstreamReconnectSession = 0;
+    m_webstreamReconnectNextMs = 0;
     m_unstableStreamFailures = 0;
     m_terminalReason = AudioTerminalReason::NONE;
     resetStreamConnectionHealth();
@@ -3107,12 +3251,14 @@ AudioTerminalReason Audio::consumeTerminalReason() {
 }
 
 void Audio::resetStreamConnectionHealth() {
+    clearBufferedReconnectPcmWatch();
     // E36REC1C: per physical connection only — not session unstable budget / только текущее соединение
     m_f_streamHadAudio = false;
     m_f_shortLivedCounted = false;
     m_f_streamConnectionStable = false;
+    m_f_disconnectSnapshotLogged = false;
     m_streamAudioStartedMs = 0;
-    m_streamLastAudioProgressMs = 0;
+    m_streamLastAudioProgressMs.store(0, std::memory_order_release);
 }
 
 void Audio::noteStreamAudioProgress() {
@@ -3122,12 +3268,93 @@ void Audio::noteStreamAudioProgress() {
         m_f_streamHadAudio = true;
         m_streamAudioStartedMs = now;
     }
-    m_streamLastAudioProgressMs = now;
+    m_streamLastAudioProgressMs.store(now, std::memory_order_release);
 }
 
-bool Audio::attemptInternalReconnect() {
+bool Audio::tryBufferedWebstreamReconnect(bool& transportAttempted) {
+    // E-AT4: every early return below rejects the buffered path *before* any
+    // socket work, so it costs no transport attempt.
+    // E-AT4: все ранние выходы ниже отказывают до работы с сокетом и не стоят
+    // ни одной transport-попытки.
+    transportAttempted = false;
+    if (m_dataMode != AUDIO_DATA) return false;
+    if (m_streamType != ST_WEBSTREAM) return false;
+    // E-MP2: AAC and plain MP3 only. Ogg/FLAC carry container state across packets,
+    // so a retained buffer cannot simply be continued for them.
+    // E-MP2: только AAC и обычный MP3. У Ogg/FLAC состояние контейнера переходит
+    // между пакетами, поэтому удержанный буфер для них просто так не продолжить.
+    if (m_codec != CODEC_AAC && m_codec != CODEC_MP3) return false;
+    if (m_f_tts || m_f_allDataReceived) return false;
+    if (!m_lastHost.valid()) return false;
+    if (InBuff.bufferFilled() == 0) return false;
+    // AAC continues the old tail by byte-exact dedup, so it needs a frozen stitch
+    // signature. MP3 has no matcher: the retained frames are simply played out and
+    // the new stream lands after them, where the existing MP3 resync takes over.
+    // That costs a glitched frame at the seam instead of a full re-buffer gap -
+    // seamlessness is not claimed.
+    // AAC продолжает старый хвост побайтовой дедупликацией, поэтому ему нужна
+    // замороженная сигнатура стыка. У MP3 матчера нет: удержанные кадры просто
+    // доигрываются, новый поток ложится за ними, и дальше работает существующий
+    // resync MP3. Цена — испорченный кадр на стыке вместо полной паузы на
+    // пере-буферизацию; бесшовность не обещается.
+    // E-MP4: both codecs now continue the old tail by byte-exact dedup, so both
+    // require a frozen stitch signature. Without one the clean path runs instead -
+    // that is what stops the duplicated audio the append-only attempt produced.
+    // E-MP4: оба кодека продолжают старый хвост побайтовой дедупликацией, поэтому
+    // обоим нужна замороженная сигнатура стыка. Без неё идёт чистый путь — именно
+    // это убирает повторы, которые давала простая дописка.
+    if (!m_f_aacOverlapArmed) return false;
+
+    // E-MP3: MP3 has no dedup, so each reconnect re-appends the burst the server
+    // replays from its own buffer and the retained data only ever grows. Device
+    // evidence: +80 KiB per cycle, 126 KiB -> 629 KiB over seven reconnects, i.e.
+    // about 39 s behind live and heading for the buffer ceiling. Cap what we are
+    // willing to retain - above it the clean reconnect runs instead and resets both
+    // the buffer and the drift. AAC is exempt: its byte-exact dedup drops the
+    // duplicate prefix, so it does not accumulate.
+    // E-MP3: у MP3 нет дедупликации, поэтому каждое переподключение дописывает burst,
+    // который сервер отдаёт из своего буфера, и удержанные данные только растут.
+    // Данные с устройства: +80 КиБ за цикл, 126 КиБ -> 629 КиБ за семь
+    // переподключений, то есть около 39 с отставания от эфира и путь к потолку
+    // буфера. Ограничиваем то, что готовы удержать: выше порога отрабатывает обычный
+    // clean reconnect, сбрасывая и буфер, и отставание. AAC не затронут — его
+    // побайтовая дедупликация отбрасывает дубль, накопления нет.
+    if (m_codec == CODEC_MP3) {
+        const int32_t retainCap = InBuff.getBufsize() / MP3_BUFFERED_RETAIN_DIVISOR;
+        const int32_t retained  = (int32_t)InBuff.bufferFilled();
+        if (retainCap > 0 && retained > retainCap) {
+            Serial.printf("[AUDIO.RETRY] buffered reconnect declined: mp3 retain inbuf=%ld cap=%ld\n",
+                          (long)retained, (long)retainCap);
+            return false;
+        }
+    }
+
+    m_preservedStreamCodec = m_codec;
+    m_stagedCodec = CODEC_NONE;                 // E-HO2: staging starts empty
+    m_stagedPlaylistFormat = FORMAT_NONE;
+    m_f_stagedOgg = false;
+    m_f_preserveStreamReconnect = true;
+    // The caller only reaches here with the socket already known disconnected,
+    // so httpPrint() below always opens a new connection.
+    // Сюда попадаем только при уже разорванном сокете, поэтому httpPrint ниже
+    // всегда открывает новое соединение.
+    transportAttempted = true;
+    if (httpPrint(m_lastHost.get())) return true;
+
+    m_f_preserveStreamReconnect = false;
+    m_preservedStreamCodec = CODEC_NONE;
+    return false;
+}
+
+bool Audio::attemptInternalReconnect(bool countTransportAttempt) {
     // E36REC1C: classify outgoing connection before reset / классификация до сброса полей
-    if (m_f_streamHadAudio && !m_f_shortLivedCounted) {
+    if (countTransportAttempt) {
+        // E-AT4: one physical connect attempt = one budget unit.
+        // E-AT4: одна физическая попытка подключения = одна единица бюджета.
+        if (!audio_safe::retryBudgetTryConsume(m_unstableStreamFailures,
+                                               MAX_UNSTABLE_STREAM_FAILURES)) return false;
+    }
+    else if (m_f_streamHadAudio && !m_f_shortLivedCounted) {
         const uint32_t livedMs = millis() - m_streamAudioStartedMs;
         const bool effectivelyStable =
             m_f_streamConnectionStable ||
@@ -3149,7 +3376,10 @@ bool Audio::attemptInternalReconnect() {
 }
 
 void Audio::finishUnstableStreamExhausted() {
-    Serial.println("[AUDIO.RETRY] unstable exhausted");
+    m_f_webstreamReconnectPending = false;
+    m_webstreamReconnectSession = 0;
+    m_webstreamReconnectNextMs = 0;
+    Serial.println("[AUDIO.RETRY] reconnect exhausted -> terminal stop");
     m_terminalReason = AudioTerminalReason::UNSTABLE_STREAM_EXHAUSTED;
     m_unstableStreamFailures = 0;
     resetStreamConnectionHealth();
@@ -3157,13 +3387,782 @@ void Audio::finishUnstableStreamExhausted() {
 }
 
 void Audio::pollStreamStability() {
+    const uint32_t lastAudioProgressMs =
+        m_streamLastAudioProgressMs.load(std::memory_order_acquire);
+    // PCM from the preserved old tail does not prove that the replacement
+    // transport or its compressed-stream stitch is healthy.
+    if(m_f_aacOverlapActive || m_f_bufferedReconnectPcmWatch) return;
     if (!m_f_streamHadAudio || m_f_streamConnectionStable) return;
     const uint32_t now = millis();
     if ((now - m_streamAudioStartedMs) < UNSTABLE_STREAM_STABLE_MS) return;
-    if ((now - m_streamLastAudioProgressMs) > PCM_RECENT_MS) return;
+    if (!lastAudioProgressMs || (now - lastAudioProgressMs) > PCM_RECENT_MS) return;
     m_f_streamConnectionStable = true;
     m_unstableStreamFailures = 0;
     Serial.println("[AUDIO.RETRY] stream stable");
+}
+
+void Audio::clearBufferedReconnectPcmWatch() {
+    m_f_bufferedReconnectPcmWatch = false;
+    m_bufferedReconnectPcmSession = 0;
+    m_bufferedReconnectPcmStartedMs = 0;
+}
+
+void Audio::resetAacOverlapDiagnostic(bool clearHistory) {
+    m_f_aacOverlapArmed = false;
+    m_f_aacOverlapActive = false;
+    m_aacOverlapMatched = 0;
+    m_aacOverlapMatchCount = 0;
+    m_aacOverlapRetry = 0;
+    m_aacOverlapSession = 0;
+    m_aacOverlapStartedMs = 0;
+    m_aacOverlapScanBytes = 0;
+    m_aacOverlapFirstEnd = 0;
+    m_aacOverlapLastEnd = 0;
+    m_aacOverlapOldInbuf = 0;
+    m_aacOverlapSignatureHash = 0;
+    m_aacOverlapStageWrite = 0;
+    m_aacOverlapStageCount = 0;
+    m_aacOverlapStageTotal = 0;
+
+    if(clearHistory) {
+        m_aacPayloadTailWrite = 0;
+        m_aacPayloadTailCount = 0;
+        memset(m_aacPayloadTail, 0, sizeof(m_aacPayloadTail));
+        memset(m_aacOverlapSignature, 0, sizeof(m_aacOverlapSignature));
+        memset(m_aacOverlapPrefix, 0, sizeof(m_aacOverlapPrefix));
+    }
+}
+
+void Audio::rememberAacWebstreamPayload(const uint8_t* data, size_t len) {
+    // E-MP4: the tail is raw post-ICY, post-chunk payload - codec-neutral by nature.
+    // E-MP4: хвост — сырой payload после ICY и chunk, по природе кодеко-нейтрален.
+    if(!data || !len || !overlapDedupEligibleCodec() ||
+       m_streamType != ST_WEBSTREAM || m_playlistFormat == FORMAT_M3U8 || m_f_tts) return;
+
+    for(size_t i = 0; i < len; ++i) {
+        m_aacPayloadTail[m_aacPayloadTailWrite] = data[i];
+        m_aacPayloadTailWrite++;
+        if(m_aacPayloadTailWrite == AAC_OVERLAP_SIGNATURE_BYTES) m_aacPayloadTailWrite = 0;
+        if(m_aacPayloadTailCount < AAC_OVERLAP_SIGNATURE_BYTES) m_aacPayloadTailCount++;
+    }
+}
+
+void Audio::reportAacOverlapDiagnostic(const char* reason) {
+    if(!m_f_aacOverlapActive) return;
+
+    if(m_aacOverlapMatchCount == 0) {
+        Serial.printf("[AUDIO.DEDUP] diagnostic no_match session=%lu retry=%u/%u old_inbuf=%lu scanned=%lu staged=%lu stage_total=%lu overwritten=%lu signature=%u hash=%08lX reason=%s\n",
+                      (unsigned long)m_aacOverlapSession,
+                      (unsigned)m_aacOverlapRetry,
+                      (unsigned)MAX_UNSTABLE_STREAM_FAILURES,
+                      (unsigned long)m_aacOverlapOldInbuf,
+                      (unsigned long)m_aacOverlapScanBytes,
+                      (unsigned long)m_aacOverlapStageCount,
+                      (unsigned long)m_aacOverlapStageTotal,
+                      (unsigned long)(m_aacOverlapStageTotal - m_aacOverlapStageCount),
+                      (unsigned)AAC_OVERLAP_SIGNATURE_BYTES,
+                      (unsigned long)m_aacOverlapSignatureHash,
+                      reason ? reason : "bounded_limit");
+    }
+    else {
+        const uint32_t firstOffset = m_aacOverlapFirstEnd - AAC_OVERLAP_SIGNATURE_BYTES;
+        const uint32_t overlapMs = m_nominal_bitrate
+            ? static_cast<uint32_t>((static_cast<uint64_t>(m_aacOverlapFirstEnd) * 8000ULL) / m_nominal_bitrate)
+            : 0;
+        Serial.printf("[AUDIO.DEDUP] diagnostic %s session=%lu retry=%u/%u old_inbuf=%lu scanned=%lu matches=%u first_offset=%lu first_overlap=%lu last_overlap=%lu overlap_ms=%lu signature=%u hash=%08lX reason=%s\n",
+                      m_aacOverlapMatchCount == 1 ? "unique_within_window" : "ambiguous_within_window",
+                      (unsigned long)m_aacOverlapSession,
+                      (unsigned)m_aacOverlapRetry,
+                      (unsigned)MAX_UNSTABLE_STREAM_FAILURES,
+                      (unsigned long)m_aacOverlapOldInbuf,
+                      (unsigned long)m_aacOverlapScanBytes,
+                      (unsigned)m_aacOverlapMatchCount,
+                      (unsigned long)firstOffset,
+                      (unsigned long)m_aacOverlapFirstEnd,
+                      (unsigned long)m_aacOverlapLastEnd,
+                      (unsigned long)overlapMs,
+                      (unsigned)AAC_OVERLAP_SIGNATURE_BYTES,
+                      (unsigned long)m_aacOverlapSignatureHash,
+                      reason ? reason : "bounded_limit");
+    }
+    resetAacOverlapDiagnostic(false);
+}
+
+void Audio::armAacOverlapDiagnostic() {
+    if(m_f_aacOverlapActive) {
+        if(m_aacOverlapSession == m_playbackSession && m_f_running) {
+            // Keep the active matcher intact during the reconnect grace. A
+            // transient connected() recovery can continue the same search; a
+            // real replacement socket restarts it after its HTTP header.
+            Serial.printf("[AUDIO.DEDUP] search interrupted session=%lu retry=%u/%u scanned=%lu -> keep signature\n",
+                          (unsigned long)m_aacOverlapSession,
+                          (unsigned)m_aacOverlapRetry,
+                          (unsigned)MAX_UNSTABLE_STREAM_FAILURES,
+                          (unsigned long)m_aacOverlapScanBytes);
+            return;
+        }
+        resetAacOverlapDiagnostic(false);
+    }
+    else resetAacOverlapDiagnostic(false);
+
+    const uint32_t bufferedBytes = InBuff.bufferFilled();
+    const bool eligible = m_f_running && m_f_streamHadAudio &&
+                          overlapDedupEligibleCodec() && m_streamType == ST_WEBSTREAM &&
+                          m_playlistFormat != FORMAT_M3U8 && !m_f_tts && !m_f_allDataReceived &&
+                          // ADTS check applies to AAC only; an ICY MP3 stream is always raw frames.
+                          // Проверка ADTS относится только к AAC; ICY MP3 — всегда сырые кадры.
+                          (m_codec != CODEC_AAC || AACGetFormat() == 2) &&
+                          bufferedBytes >= AAC_OVERLAP_SIGNATURE_BYTES &&
+                          m_aacPayloadTailCount == AAC_OVERLAP_SIGNATURE_BYTES;
+    if(!eligible) return;
+
+    if(!m_aacOverlapStaging.valid() && psramFound()) {
+        m_aacOverlapStaging.alloc(AAC_OVERLAP_STAGING_BYTES, "aac_overlap_staging");
+        if(m_aacOverlapStaging.valid()) {
+            Serial.printf("[AUDIO.DEDUP] PSRAM staging ready bytes=%lu\n",
+                          (unsigned long)m_aacOverlapStaging.size());
+        }
+    }
+
+    // m_aacPayloadTailWrite points to the oldest byte once the rolling tail is full.
+    uint32_t signatureHash = 2166136261u; // FNV-1a, log correlation only; matching remains byte-exact.
+    for(uint16_t i = 0; i < AAC_OVERLAP_SIGNATURE_BYTES; ++i) {
+        const uint16_t tailPos = (m_aacPayloadTailWrite + i) % AAC_OVERLAP_SIGNATURE_BYTES;
+        const uint8_t value = m_aacPayloadTail[tailPos];
+        m_aacOverlapSignature[i] = value;
+        signatureHash ^= value;
+        signatureHash *= 16777619u;
+    }
+
+    // Prefix table lets one exact signature match continue across network and ICY metadata chunks.
+    m_aacOverlapPrefix[0] = 0;
+    uint16_t matched = 0;
+    for(uint16_t i = 1; i < AAC_OVERLAP_SIGNATURE_BYTES; ++i) {
+        while(matched && m_aacOverlapSignature[i] != m_aacOverlapSignature[matched]) {
+            matched = m_aacOverlapPrefix[matched - 1];
+        }
+        if(m_aacOverlapSignature[i] == m_aacOverlapSignature[matched]) matched++;
+        m_aacOverlapPrefix[i] = matched;
+    }
+
+    m_f_aacOverlapArmed = true;
+    m_aacOverlapSession = m_playbackSession;
+    m_aacOverlapOldInbuf = bufferedBytes;
+    m_aacOverlapSignatureHash = signatureHash;
+}
+
+void Audio::startAacOverlapDiagnostic() {
+    if(!m_f_aacOverlapArmed) return;
+    if(m_aacOverlapSession != m_playbackSession || !m_f_running ||
+       !overlapDedupEligibleCodec() || m_streamType != ST_WEBSTREAM) {   // E-MP4
+        resetAacOverlapDiagnostic(false);
+        return;
+    }
+
+    m_f_aacOverlapActive = true;
+    m_aacOverlapMatched = 0;
+    m_aacOverlapMatchCount = 0;
+    m_aacOverlapRetry = m_unstableStreamFailures;
+    m_aacOverlapStartedMs = millis();
+    m_aacOverlapScanBytes = 0;
+    m_aacOverlapFirstEnd = 0;
+    m_aacOverlapLastEnd = 0;
+    m_aacOverlapStageWrite = 0;
+    m_aacOverlapStageCount = 0;
+    m_aacOverlapStageTotal = 0;
+
+    // The frozen signature belongs to the old transport. Start the rolling tail
+    // afresh so a short-lived new connection cannot create a signature spanning
+    // the old/new socket boundary on the following reconnect.
+    m_aacPayloadTailWrite = 0;
+    m_aacPayloadTailCount = 0;
+}
+
+void Audio::stageAacOverlapPayload(const uint8_t* data, size_t len) {
+    if(!data || !len || !m_aacOverlapStaging.valid()) return;
+
+    const uint32_t capacity = static_cast<uint32_t>(m_aacOverlapStaging.size());
+    if(!capacity) return;
+
+    const size_t originalLen = len;
+    while(len) {
+        const size_t chunk = min(len, static_cast<size_t>(capacity - m_aacOverlapStageWrite));
+        memcpy(m_aacOverlapStaging.get() + m_aacOverlapStageWrite, data, chunk);
+        m_aacOverlapStageWrite = (m_aacOverlapStageWrite + chunk) % capacity;
+        m_aacOverlapStageCount = min(capacity, m_aacOverlapStageCount + static_cast<uint32_t>(chunk));
+        data += chunk;
+        len -= chunk;
+    }
+    m_aacOverlapStageTotal = originalLen > UINT32_MAX - m_aacOverlapStageTotal
+        ? UINT32_MAX
+        : m_aacOverlapStageTotal + static_cast<uint32_t>(originalLen);
+}
+
+size_t Audio::filterAacOverlapPayload(uint8_t* data, size_t len) {
+    if(!data || !len) return 0;
+    if(!m_f_aacOverlapActive) return len;
+    if(m_aacOverlapSession != m_playbackSession) {
+        resetAacOverlapDiagnostic(false);
+        return len;
+    }
+    // Keep the newest bounded, protocol-stripped payload even after the KMP
+    // search window closes. A no-match AAC restart can then continue from the
+    // current socket position instead of waiting for the same bytes again.
+    stageAacOverlapPayload(data, len);
+    if(m_aacOverlapScanBytes >= AAC_OVERLAP_SCAN_LIMIT_BYTES ||
+       (millis() - m_aacOverlapStartedMs) >= AAC_OVERLAP_SCAN_LIMIT_MS) {
+        // A bounded no-match decision has already been reached. Keep draining
+        // the socket without publishing an unproven splice while the playable
+        // old tail runs down; the PCM-stale gate performs the clean fallback.
+        return 0;
+    }
+
+    for(size_t i = 0; i < len; ++i) {
+        const uint8_t value = data[i];
+        while(m_aacOverlapMatched && value != m_aacOverlapSignature[m_aacOverlapMatched]) {
+            m_aacOverlapMatched = m_aacOverlapPrefix[m_aacOverlapMatched - 1];
+        }
+        if(value == m_aacOverlapSignature[m_aacOverlapMatched]) m_aacOverlapMatched++;
+        m_aacOverlapScanBytes++;
+
+        if(m_aacOverlapMatched == AAC_OVERLAP_SIGNATURE_BYTES) {
+            m_aacOverlapMatchCount = 1;
+            m_aacOverlapFirstEnd = m_aacOverlapScanBytes;
+            m_aacOverlapLastEnd = m_aacOverlapScanBytes;
+
+            const size_t dropFromChunk = i + 1;
+            const size_t bytesToPublish = len - dropFromChunk;
+            const uint32_t overlapMs = m_nominal_bitrate
+                ? static_cast<uint32_t>((static_cast<uint64_t>(m_aacOverlapScanBytes) * 8000ULL) / m_nominal_bitrate)
+                : 0;
+
+            Serial.printf("[AUDIO.DEDUP] applied exact_match session=%lu retry=%u/%u old_inbuf=%lu dropped=%lu overlap_ms=%lu signature=%u hash=%08lX kept=%lu\n",
+                          (unsigned long)m_aacOverlapSession,
+                          (unsigned)m_aacOverlapRetry,
+                          (unsigned)MAX_UNSTABLE_STREAM_FAILURES,
+                          (unsigned long)m_aacOverlapOldInbuf,
+                          (unsigned long)m_aacOverlapScanBytes,
+                          (unsigned long)overlapMs,
+                          (unsigned)AAC_OVERLAP_SIGNATURE_BYTES,
+                          (unsigned long)m_aacOverlapSignatureHash,
+                          (unsigned long)bytesToPublish);
+
+            // The exact match proves that the frozen old suffix and the new
+            // transport are byte-contiguous. Seed the rolling tail with that
+            // suffix, then remember only bytes after the stitch point.
+            memcpy(m_aacPayloadTail, m_aacOverlapSignature, AAC_OVERLAP_SIGNATURE_BYTES);
+            m_aacPayloadTailWrite = 0;
+            m_aacPayloadTailCount = AAC_OVERLAP_SIGNATURE_BYTES;
+            resetAacOverlapDiagnostic(false);
+            if(m_f_bufferedReconnectPcmWatch &&
+               m_bufferedReconnectPcmSession == m_playbackSession) {
+                // Give the decoder a full probation window after the actual
+                // compressed-stream stitch, not merely after TLS/header success.
+                const uint32_t stitchMs = millis();
+                m_bufferedReconnectPcmStartedMs = stitchMs;
+                // The normal stable interval is measured from the proven
+                // transport stitch; PCM produced before it belongs to old data.
+                m_streamAudioStartedMs = stitchMs;
+                m_f_streamConnectionStable = false;
+            }
+
+            if(bytesToPublish) memmove(data, data + dropFromChunk, bytesToPublish);
+            return bytesToPublish;
+        }
+
+        if(m_aacOverlapScanBytes >= AAC_OVERLAP_SCAN_LIMIT_BYTES) {
+            // The already-read remainder of this network block is intentionally
+            // withheld too. pollAacOverlapDiagnostic() performs the clean AAC
+            // fallback before any unmatched fresh payload reaches the decoder.
+            return 0;
+        }
+    }
+
+    // Until the old suffix is found, the fresh burst is consumed from the
+    // socket but not published to InBuff. The preserved old buffer keeps playing.
+    return 0;
+}
+
+void Audio::pollAacOverlapDiagnostic() {
+    if(!m_f_aacOverlapActive) return;
+    if(m_aacOverlapSession != m_playbackSession || !m_f_running) {
+        resetAacOverlapDiagnostic(false);
+        return;
+    }
+    const char* reason = nullptr;
+    if(m_aacOverlapScanBytes >= AAC_OVERLAP_SCAN_LIMIT_BYTES) reason = "scan_limit";
+    else if((millis() - m_aacOverlapStartedMs) >= AAC_OVERLAP_SCAN_LIMIT_MS) reason = "timeout";
+    if(!reason) return;
+
+    const uint32_t lastAudioProgressMs =
+        m_streamLastAudioProgressMs.load(std::memory_order_acquire);
+    const uint32_t now = millis();
+    const uint32_t pcmAgeMs = lastAudioProgressMs
+        ? now - lastAudioProgressMs
+        : now - m_aacOverlapStartedMs;
+    if(pcmAgeMs < BUFFERED_RECONNECT_PCM_STALL_MS) return;
+    restartAacAfterBufferedReconnect(pcmAgeMs, reason);
+}
+
+bool Audio::restartAacAfterBufferedReconnect(uint32_t pcmAgeMs, const char* reason) {
+    const uint32_t requestedSession = m_playbackSession;
+    if(xSemaphoreTake(mutex_audioTask, 0.3 * configTICK_RATE_HZ) != pdTRUE) return false;
+
+    if(!m_f_running || m_playbackSession != requestedSession ||
+       m_dataMode != AUDIO_DATA || m_streamType != ST_WEBSTREAM ||
+       !overlapDedupEligibleCodec()) {   // E-MP4
+        xSemaphoreGive(mutex_audioTask);
+        return false;
+    }
+
+    // The audio task updates this timestamp while holding mutex_audioTask.
+    // Re-check it under the same mutex so PCM resuming between the poll and
+    // this destructive fallback cannot reset a healthy decoder.
+    const uint32_t lastAudioProgressMs =
+        m_streamLastAudioProgressMs.load(std::memory_order_acquire);
+    const uint32_t fallbackStartedMs = m_bufferedReconnectPcmStartedMs
+        ? m_bufferedReconnectPcmStartedMs
+        : m_aacOverlapStartedMs;
+    const uint32_t now = millis();
+    const uint32_t confirmedPcmAgeMs = lastAudioProgressMs
+        ? now - lastAudioProgressMs
+        : now - fallbackStartedMs;
+    if(confirmedPcmAgeMs < BUFFERED_RECONNECT_PCM_STALL_MS) {
+        xSemaphoreGive(mutex_audioTask);
+        return false;
+    }
+    pcmAgeMs = confirmedPcmAgeMs;
+
+    const uint32_t stagedWrite = m_aacOverlapStageWrite;
+    const uint32_t stagedCount = m_aacOverlapStageCount;
+    const uint32_t stagedTotal = m_aacOverlapStageTotal;
+    if(m_f_aacOverlapActive) reportAacOverlapDiagnostic(reason ? reason : "clean_fallback");
+    resetAacOverlapDiagnostic(true);
+
+    const uint32_t session = m_playbackSession;
+    const uint32_t droppedBytes = InBuff.bufferFilled();
+    const uint8_t retry = m_unstableStreamFailures;
+
+    // The old and new live AAC byte streams are not guaranteed to meet on an ADTS frame boundary.
+    // Старый и новый live AAC-потоки не обязаны стыковаться на границе ADTS-кадра.
+    // E-MP4: restore the decoder that actually owns this stream. AAC keeps the exact
+    // previous behaviour; the MP3 branch is new and cannot affect it.
+    // E-MP4: восстанавливаем декодер, которому принадлежит поток. Для AAC поведение
+    // прежнее байт в байт; ветка MP3 новая и на него не влияет.
+    const bool restartMp3 = (m_codec == CODEC_MP3);
+    clearBufferedReconnectPcmWatch();
+    m_f_lockInBuffer = true;
+    InBuff.resetBuffer();
+    if(restartMp3) MP3Decoder_FreeBuffers();
+    else           AACDecoder_FreeBuffers();
+    m_validSamples = 0;
+    m_f_playing = false;
+    m_f_decode_ready = false;
+    m_f_firstPlayCall = true;
+    m_f_stream = false;
+    m_f_eof = false;
+    m_f_allDataReceived = false;
+    m_bytesNotConsumed = 0;
+    m_fnsy.nextSync = 0;
+    m_fnsy.swnf = 0;
+
+    const bool decoderReady = restartMp3 ? MP3Decoder_AllocateBuffers()
+                                        : AACDecoder_AllocateBuffers();   // E-MP4
+    size_t restoredBytes = 0;
+    if(decoderReady) {
+        InBuff.changeMaxBlockSize(restartMp3 ? m_frameSizeMP3 : m_frameSizeAAC);   // E-MP4
+
+        const uint32_t stageCapacity = m_aacOverlapStaging.valid()
+            ? static_cast<uint32_t>(m_aacOverlapStaging.size())
+            : 0;
+        size_t remaining = min(static_cast<size_t>(stagedCount),
+                               static_cast<size_t>(AAC_OVERLAP_FALLBACK_RESTORE_BYTES));
+        remaining = min(remaining, InBuff.freeSpace());
+        uint32_t stagePos = stageCapacity
+            ? (stagedWrite + stageCapacity - static_cast<uint32_t>(remaining)) % stageCapacity
+            : 0;
+
+        while(stageCapacity && remaining) {
+            const size_t stageChunk = min(remaining, static_cast<size_t>(stageCapacity - stagePos));
+            const size_t copyBytes = min(stageChunk, InBuff.writeSpace());
+            if(!copyBytes) break;
+            memcpy(InBuff.getWritePtr(), m_aacOverlapStaging.get() + stagePos, copyBytes);
+            InBuff.bytesWritten(copyBytes);
+            restoredBytes += copyBytes;
+            remaining -= copyBytes;
+            stagePos = (stagePos + copyBytes) % stageCapacity;
+        }
+
+        // resetAacOverlapDiagnostic(true) cleared the previous transport tail.
+        // Re-seed it from only the restored live payload suffix.
+        const size_t historyBytes = min(restoredBytes, static_cast<size_t>(AAC_OVERLAP_SIGNATURE_BYTES));
+        if(stageCapacity && historyBytes) {
+            uint32_t historyPos =
+                (stagedWrite + stageCapacity - static_cast<uint32_t>(historyBytes)) % stageCapacity;
+            const size_t firstPart = min(historyBytes, static_cast<size_t>(stageCapacity - historyPos));
+            rememberAacWebstreamPayload(m_aacOverlapStaging.get() + historyPos, firstPart);
+            if(firstPart < historyBytes) {
+                rememberAacWebstreamPayload(m_aacOverlapStaging.get(), historyBytes - firstPart);
+            }
+        }
+
+    }
+    m_f_lockInBuffer = false;
+    xSemaphoreGive(mutex_audioTask);
+
+    if(!decoderReady) {
+        AUDIO_ERROR("The AACDecoder could not be reinitialized after buffered reconnect");
+        stopSong();
+        return true;
+    }
+
+    // Keep the same playback session and retry count; only the unsafe compressed splice is discarded.
+    // Сессия и retry-счётчик сохраняются; удаляется только небезопасный стык сжатых данных.
+    resetStreamConnectionHealth();
+    Serial.printf("[AUDIO.RETRY] buffered reconnect clean fallback reason=%s session=%lu retry=%u/%u pcm_age_ms=%lu dropped=%lu stage_total=%lu staged=%lu restored=%lu -> AAC restart prebuffer=%lu\n",
+                  reason ? reason : "pcm_stall",
+                  (unsigned long)session,
+                  (unsigned)retry,
+                  (unsigned)MAX_UNSTABLE_STREAM_FAILURES,
+                  (unsigned long)pcmAgeMs,
+                  (unsigned long)droppedBytes,
+                  (unsigned long)stagedTotal,
+                  (unsigned long)stagedCount,
+                  (unsigned long)restoredBytes,
+                  (unsigned long)AAC_WEBSTREAM_PREBUFFER_BYTES);
+    return true;
+}
+
+void Audio::pollBufferedReconnectPcmWatch() {
+    if(!m_f_bufferedReconnectPcmWatch) return;
+    if(m_bufferedReconnectPcmSession != m_playbackSession ||
+       !m_f_running || m_dataMode != AUDIO_DATA ||
+       m_streamType != ST_WEBSTREAM || !overlapDedupEligibleCodec()) {   // E-MP4
+        clearBufferedReconnectPcmWatch();
+        return;
+    }
+
+    const uint32_t lastAudioProgressMs =
+        m_streamLastAudioProgressMs.load(std::memory_order_acquire);
+    const uint32_t now = millis();
+    const uint32_t pcmAgeMs = lastAudioProgressMs
+        ? now - lastAudioProgressMs
+        : now - m_bufferedReconnectPcmStartedMs;
+
+    if(pcmAgeMs >= BUFFERED_RECONNECT_PCM_STALL_MS) {
+        restartAacAfterBufferedReconnect(pcmAgeMs);
+        return;
+    }
+
+    // PCM heard while the exact-match search is still withholding fresh bytes
+    // belongs to the preserved old tail and cannot verify the new splice yet.
+    if(m_f_aacOverlapActive) return;
+
+    // Stay on probation long enough for the preserved compressed tail to drain into the new stream.
+    // Пробное окно должно пережить остаток старого сжатого буфера и дойти до нового потока.
+    if((now - m_bufferedReconnectPcmStartedMs) >= BUFFERED_RECONNECT_PCM_PROBATION_MS) {
+        Serial.printf("[AUDIO.RETRY] buffered reconnect PCM verified session=%lu\n",
+                      (unsigned long)m_playbackSession);
+        clearBufferedReconnectPcmWatch();
+    }
+}
+
+void Audio::cancelWebstreamReconnect(const char* reason) {
+    if (!m_f_webstreamReconnectPending) return;
+    Serial.printf("[AUDIO.RETRY] reconnect cancelled: %s session=%lu retry=%u/%u\n",
+                  reason ? reason : "new playback session",
+                  (unsigned long)m_webstreamReconnectSession,
+                  (unsigned)m_unstableStreamFailures,
+                  (unsigned)MAX_UNSTABLE_STREAM_FAILURES);
+    m_f_webstreamReconnectPending = false;
+    m_f_preserveStreamReconnect = false;
+    m_preservedStreamCodec = CODEC_NONE;
+    resetAacOverlapDiagnostic(false);
+    m_webstreamReconnectSession = 0;
+    m_webstreamReconnectNextMs = 0;
+}
+
+void Audio::scheduleWebstreamReconnect(bool clientConnected, uint32_t availableBytes) {
+    if (!m_f_disconnectSnapshotLogged) {
+        m_f_disconnectSnapshotLogged = true;
+        const uint32_t lastAudioProgressMs =
+            m_streamLastAudioProgressMs.load(std::memory_order_acquire);
+        const uint32_t now = millis();
+        const int32_t pcmAgeMs = lastAudioProgressMs
+            ? static_cast<int32_t>(now - lastAudioProgressMs)
+            : -1;
+        Serial.printf("[AUDIO.RETRY] disconnect detected session=%lu\n",
+                      (unsigned long)m_playbackSession);
+        Serial.printf(
+            "[AUDIO.RETRY] snapshot client.connected=%u client.available=%lu inbuf=%lu data_mode=%s(%u) stream_type=%s(%u) codec=%s(%u) stream=%u metadata=%u metacount=%lu chunked=%u all_received=%u tts=%u session=%lu retry=%u/%u pcm_age_ms=%ld\n",
+            (unsigned)clientConnected,
+            (unsigned long)availableBytes,
+            (unsigned long)InBuff.bufferFilled(),
+            dataModeStr[m_dataMode], (unsigned)m_dataMode,
+            streamTypeStr[m_streamType], (unsigned)m_streamType,
+            codecname[m_codec], (unsigned)m_codec,
+            (unsigned)m_f_stream,
+            (unsigned)m_f_metadata,
+            (unsigned long)m_metacount,
+            (unsigned)m_f_chunked,
+            (unsigned)m_f_allDataReceived,
+            (unsigned)m_f_tts,
+            (unsigned long)m_playbackSession,
+            (unsigned)m_unstableStreamFailures,
+            (unsigned)MAX_UNSTABLE_STREAM_FAILURES,
+            (long)pcmAgeMs);
+    }
+
+    if (availableBytes || m_f_webstreamReconnectPending) return;
+
+    // Give Player one non-blocking queue turn before cleanup/connect. /
+    // Даём Player один неблокирующий проход очереди до cleanup/connect.
+    armAacOverlapDiagnostic();
+    m_f_webstreamReconnectPending = true;
+    m_webstreamReconnectSession = m_playbackSession;
+    m_webstreamReconnectNextMs = millis() + WEBSTREAM_RECONNECT_GRACE_MS;
+}
+
+// E-VS7: runs on the player task, the owner of m_client. A request that no longer
+// matches the current playback session is dropped: manual STOP and station change
+// keep priority, and a reconnect is never scheduled for a stream nobody plays.
+// E-VS7: выполняется в задаче Player — владельце m_client. Запрос, не совпадающий
+// с текущей playback session, отбрасывается: ручной STOP и смена станции сохраняют
+// приоритет, и reconnect не планируется для потока, который никто не слушает.
+// E-ST1: called on the audio task. Publishes intent only - no socket, no decoder
+// buffers, no cross-task wait. Repeat calls before the owner runs are harmless:
+// the first reason wins, which is the one closest to the actual failure.
+// E-ST1: вызывается в аудиозадаче. Публикует только намерение — ни сокета, ни
+// буферов декодера, ни межзадачного ожидания. Повторные вызовы до обработки
+// безвредны: побеждает первая причина, то есть ближайшая к самому сбою.
+void Audio::requestStopFromAudioTask(const char* reason) {
+    uint32_t epoch = 0;
+    bool published = false;
+    portENTER_CRITICAL(&m_audioRequestMux);
+    if(!m_stopRequest.pending) {
+        // Stamped with the epoch of the stream being decoded right now, not with
+        // m_playbackSession: Player::_play() bumps that counter before the old
+        // stream is torn down, so a failure of the old stream would otherwise carry
+        // the new station's id and stop the station the user just selected.
+        // Помечаем epoch потока, который декодируется сейчас, а не
+        // m_playbackSession: Player::_play() инкрементирует его до сноса старого
+        // потока, и ошибка старого потока иначе получила бы идентификатор новой
+        // станции и остановила бы только что выбранную пользователем.
+        m_stopRequest.pending = true;
+        m_stopRequest.epoch   = m_decodeEpoch;
+        m_stopRequest.reason  = reason;
+        epoch = m_decodeEpoch;
+        published = true;
+    }
+    // The gate is raised even for a repeat call: the first request wins, but every
+    // caller must find the audio task held still afterwards.
+    // Затвор поднимается и при повторном вызове: побеждает первый запрос, но
+    // каждый вызывающий должен увидеть аудиозадачу остановленной.
+    m_f_audioTaskStopGate = true;
+    portEXIT_CRITICAL(&m_audioRequestMux);
+
+    if(!published) return;
+    Serial.printf("[AUDIO.STOP] requested by audio task reason=%s epoch=%lu\n",
+                  reason ? reason : "unknown", (unsigned long)epoch);
+}
+//****************************************************************************************
+// E-HO1: runs on the player task, the owner of m_client and of stopSong()'s
+// cross-task handshake. The whole request is taken under the same short section
+// that published it, so it can never be half-read.
+// E-HO1: выполняется в задаче Player — владельце m_client и межзадачного
+// рукопожатия stopSong(). Запрос забирается целиком под той же короткой секцией,
+// под которой публиковался, поэтому прочитать его наполовину невозможно.
+void Audio::pollAudioTaskStopRequest() {
+    AudioTaskRequest req{};
+    uint32_t currentEpoch = 0;
+    portENTER_CRITICAL(&m_audioRequestMux);
+    req = m_stopRequest;
+    currentEpoch = m_decodeEpoch;
+    m_stopRequest = AudioTaskRequest{};
+    if(req.pending) m_f_audioTaskStopGate = false;   // owner takes over from here
+    portEXIT_CRITICAL(&m_audioRequestMux);
+
+    if(!req.pending) return;
+
+    if(req.epoch != currentEpoch) {
+        Serial.printf("[AUDIO.STOP] dropped (stale) reason=%s epoch=%lu current=%lu\n",
+                      req.reason ? req.reason : "unknown",
+                      (unsigned long)req.epoch, (unsigned long)currentEpoch);
+        return;
+    }
+    Serial.printf("[AUDIO.STOP] executing reason=%s epoch=%lu\n",
+                  req.reason ? req.reason : "unknown", (unsigned long)req.epoch);
+    stopSong();
+}
+//****************************************************************************************
+// E-HO1: published from the audio task, taken by the owner. Same contract as the
+// stop request: whole-request handoff, epoch of the stream actually being decoded.
+// E-HO1: публикуется аудиозадачей, забирается владельцем. Контракт тот же, что у
+// запроса остановки: передача целиком, epoch реально декодируемого потока.
+void Audio::requestVorbisReopenFromAudioTask() {
+    uint32_t epoch = 0;
+    bool published = false;
+    portENTER_CRITICAL(&m_audioRequestMux);
+    if(!m_vorbisReopenRequest.pending) {
+        m_vorbisReopenRequest.pending = true;
+        m_vorbisReopenRequest.epoch   = m_decodeEpoch;
+        epoch = m_decodeEpoch;
+        published = true;
+    }
+    portEXIT_CRITICAL(&m_audioRequestMux);
+    if(!published) return;
+    Serial.printf("[AUDIO.RETRY] vorbis setup header unusable -> reopen requested epoch=%lu\n",
+                  (unsigned long)epoch);
+}
+//****************************************************************************************
+// E-HO1: the decode epoch changes exactly where the audio task's world is replaced -
+// decoders freed, InBuff reset. A buffered reconnect deliberately does not come
+// through here, so a continued stream keeps its epoch and its pending requests stay
+// valid.
+// E-HO1: decode epoch меняется ровно там, где заменяется мир аудиозадачи —
+// декодеры освобождены, InBuff сброшен. Buffered reconnect сюда намеренно не
+// заходит, поэтому продолженный поток сохраняет epoch, а его запросы остаются в силе.
+void Audio::beginDecodeEpoch() {
+    portENTER_CRITICAL(&m_audioRequestMux);
+    m_decodeEpoch++;
+    if(!m_decodeEpoch) m_decodeEpoch = 1;
+    m_f_audioTaskStopGate = false;
+    portEXIT_CRITICAL(&m_audioRequestMux);
+}
+//****************************************************************************************
+void Audio::pollVorbisReopenRequest() {
+    AudioTaskRequest req{};
+    uint32_t currentEpoch = 0;
+    portENTER_CRITICAL(&m_audioRequestMux);
+    req = m_vorbisReopenRequest;
+    currentEpoch = m_decodeEpoch;
+    m_vorbisReopenRequest = AudioTaskRequest{};
+    portEXIT_CRITICAL(&m_audioRequestMux);
+
+    if(!req.pending) return;
+
+    if(req.epoch != currentEpoch || !m_f_running || m_streamType != ST_WEBSTREAM) {
+        Serial.printf("[AUDIO.RETRY] vorbis reopen dropped (stale) epoch=%lu current=%lu\n",
+                      (unsigned long)req.epoch,
+                      (unsigned long)currentEpoch);
+        return;
+    }
+
+    Serial.printf("[AUDIO.RETRY] vorbis setup header unusable -> reopen stream epoch=%lu\n",
+                  (unsigned long)req.epoch);
+    if(m_client->connected()) m_client->stop();   // poll bails out while still connected
+    scheduleWebstreamReconnect(false, 0);
+}
+//****************************************************************************************
+void Audio::pollWebstreamReconnect() {
+    if (!m_f_webstreamReconnectPending) return;
+    if (m_webstreamReconnectSession != m_playbackSession) {
+        cancelWebstreamReconnect("stale session");
+        return;
+    }
+    if (static_cast<int32_t>(millis() - m_webstreamReconnectNextMs) < 0) return;
+
+    if (m_client->connected()) {
+        m_f_webstreamReconnectPending = false;
+        m_webstreamReconnectSession = 0;
+        m_webstreamReconnectNextMs = 0;
+        m_f_disconnectSnapshotLogged = false;
+        if(m_f_aacOverlapActive) {
+            Serial.printf("[AUDIO.DEDUP] search resumed after transient disconnect session=%lu scanned=%lu\n",
+                          (unsigned long)m_playbackSession,
+                          (unsigned long)m_aacOverlapScanBytes);
+        }
+        else resetAacOverlapDiagnostic(false);
+        Serial.printf("[AUDIO.RETRY] disconnect cleared before reconnect session=%lu\n",
+                      (unsigned long)m_playbackSession);
+        return;
+    }
+
+    if (!attemptInternalReconnect(true)) {
+        finishUnstableStreamExhausted();
+        return;
+    }
+
+    // E-AT4: `attempt` tracks the budget unit of the connect actually being made;
+    // it is re-read after the clean fallback takes its own unit below.
+    // E-AT4: `attempt` — номер единицы бюджета текущей попытки; перечитывается
+    // после того, как clean fallback ниже возьмёт собственную единицу.
+    uint8_t attempt = m_unstableStreamFailures;
+    const uint32_t session = m_webstreamReconnectSession;
+    Serial.printf("[AUDIO.RETRY] reconnect attempt %u/%u session=%lu\n",
+                  (unsigned)attempt,
+                  (unsigned)MAX_UNSTABLE_STREAM_FAILURES,
+                  (unsigned long)session);
+
+    const uint32_t bufferedBytes = InBuff.bufferFilled();
+    bool bufferedTransportAttempted = false;
+    if (bufferedBytes > 0 && tryBufferedWebstreamReconnect(bufferedTransportAttempted)) {
+        m_f_webstreamReconnectPending = false;
+        m_webstreamReconnectSession = 0;
+        m_webstreamReconnectNextMs = 0;
+        Serial.printf("[AUDIO.RETRY] buffered reconnect transport ready %u/%u session=%lu inbuf=%lu\n",
+                      (unsigned)attempt,
+                      (unsigned)MAX_UNSTABLE_STREAM_FAILURES,
+                      (unsigned long)session,
+                      (unsigned long)bufferedBytes);
+        return;
+    }
+
+    m_f_preserveStreamReconnect = false;
+
+    // E-AT4: the unit taken by attemptInternalReconnect(true) above is already
+    // spent by the buffered attempt. When that attempt really opened a socket,
+    // the clean fallback below is a *second* physical connect and takes its own
+    // unit, so one budget unit can no longer cover two attempts. When the
+    // buffered path bailed out before any socket work, the fallback keeps using
+    // the unit already taken. No second retry mechanism is introduced: the same
+    // MAX_UNSTABLE_STREAM_FAILURES budget and the same stability reset own it.
+    // E-AT4: единица, взятая в attemptInternalReconnect(true), уже израсходована
+    // buffered-попыткой. Если она действительно открывала сокет, clean fallback —
+    // вторая физическая попытка и берёт собственную единицу: одна единица больше
+    // не покрывает две попытки. Если buffered-путь отказал до работы с сокетом,
+    // fallback использует уже взятую единицу. Второй механизм retry не вводится.
+    if (bufferedTransportAttempted) {
+        if (!audio_safe::retryBudgetTryConsume(m_unstableStreamFailures,
+                                               MAX_UNSTABLE_STREAM_FAILURES)) {
+            Serial.printf("[AUDIO.RETRY] buffered failed, no budget for clean fallback %u/%u session=%lu\n",
+                          (unsigned)attempt,
+                          (unsigned)MAX_UNSTABLE_STREAM_FAILURES,
+                          (unsigned long)session);
+            finishUnstableStreamExhausted();
+            return;
+        }
+        attempt = m_unstableStreamFailures;
+        Serial.printf("[AUDIO.RETRY] buffered failed, clean fallback attempt %u/%u session=%lu\n",
+                      (unsigned)attempt,
+                      (unsigned)MAX_UNSTABLE_STREAM_FAILURES,
+                      (unsigned long)session);
+    }
+
+    // connecttohost() remains the fallback cleanup/TLS/header-init funnel when the buffer cannot bridge.
+    if (connecttohost(m_lastHost.get())) {
+        m_f_webstreamReconnectPending = false;
+        m_webstreamReconnectSession = 0;
+        m_webstreamReconnectNextMs = 0;
+        Serial.printf("[AUDIO.RETRY] reconnect succeeded %u/%u session=%lu\n",
+                      (unsigned)attempt,
+                      (unsigned)MAX_UNSTABLE_STREAM_FAILURES,
+                      (unsigned long)session);
+        return;
+    }
+
+    Serial.printf("[AUDIO.RETRY] reconnect failed %u/%u session=%lu\n",
+                  (unsigned)attempt,
+                  (unsigned)MAX_UNSTABLE_STREAM_FAILURES,
+                  (unsigned long)session);
+    if (attempt >= MAX_UNSTABLE_STREAM_FAILURES) {
+        finishUnstableStreamExhausted();
+        return;
+    }
+
+    m_f_webstreamReconnectPending = true;
+    m_webstreamReconnectSession = session;
+    m_webstreamReconnectNextMs = millis() + WEBSTREAM_RECONNECT_BACKOFF_MS;
 }
 //****************************************************************************************
 bool Audio::pauseResume() {
@@ -3372,8 +4371,16 @@ exit:
 }
 //****************************************************************************************
 void Audio::loop() {
+    pollAudioTaskStopRequest();  // E-ST1: a pending stop outranks everything below
+    pollVorbisReopenRequest();   // E-VS7: owner task consumes the audio-task request
+    if(m_f_webstreamReconnectPending) {
+        pollWebstreamReconnect();
+        return;
+    }
     if(!m_f_running) return;
 
+    if(m_dataMode == AUDIO_DATA) pollAacOverlapDiagnostic();
+    if(m_dataMode == AUDIO_DATA) pollBufferedReconnectPcmWatch();
     if(m_dataMode == AUDIO_DATA) pollStreamStability();
 
     if(m_playlistFormat != FORMAT_M3U8) { // normal process
@@ -3419,7 +4426,11 @@ void Audio::loop() {
     }
     else { // m3u8 datastream only
         ps_ptr<char> host("host");
-        if(m_lVar.no_host_timer > millis()) {return;}
+        // E-HL1: signed difference, so the back-off keeps working across the ~49 day
+        // millis() rollover instead of silently expiring for the rest of the wrap.
+        // E-HL1: знаковая разность, чтобы пауза продолжала работать через
+        // переполнение millis() (~49 суток), а не пропадала до конца оборота.
+        if((int32_t)(m_lVar.no_host_timer - millis()) > 0) {return;}
         switch(m_dataMode) {
             case HTTP_RESPONSE_HEADER:
                 if(!parseHttpResponseHeader()) {
@@ -3458,10 +4469,101 @@ void Audio::loop() {
                 }
             case AUDIO_PLAYLISTDATA:
                 host = parsePlaylist_M3U8();
-                if(!host.valid()) m_lVar.no_host_cnt++;
-                else {m_lVar.no_host_cnt = 0; m_lVar.no_host_timer = millis();}
+                // E-HL1: the counter only ever grows, so an equality test armed the
+                // back-off exactly once - on the second empty playlist - and every
+                // later one refetched with no pause at all. A station whose playlist
+                // stops advancing then hammers the CDN: measured at ~80 full TLS
+                // playlist requests in 54 s, which burns CPU the audio path needs and
+                // is a good way to earn a rate limit, i.e. it can prolong the very
+                // state it is trying to leave. The counter is uint8_t, so it is also
+                // clamped: wrapping past 255 would drop the back-off for two rounds.
+                // E-HL1: счётчик только растёт, поэтому сравнение на равенство
+                // включало паузу ровно один раз — на второй пустой выборке, — а все
+                // последующие шли вообще без паузы. Станция с переставшим обновляться
+                // плейлистом начинала долбить CDN: замерено ~80 полных TLS-запросов
+                // плейлиста за 54 с. Это отъедает CPU у аудиопути и хорошо зарабатывает
+                // rate limit, то есть продлевает то самое состояние, из которого
+                // пытается выйти. Счётчик uint8_t, поэтому ещё и ограничен сверху:
+                // переполнение через 255 сняло бы паузу на два круга.
+                if(!host.valid()) {
+                    if(m_lVar.no_host_cnt < 255) m_lVar.no_host_cnt++;
+                }
+                else {
+                    m_lVar.no_host_cnt = 0;
+                    m_lVar.no_host_timer = millis();
+                    m_m3u8StallBeganMs = 0;
+                }
 
-                if(m_lVar.no_host_cnt == 2){m_lVar.no_host_timer = millis() + 2000;} // no new url? wait 2 seconds
+                if(m_lVar.no_host_cnt >= 2) {
+                    if(!m_m3u8StallBeganMs) m_m3u8StallBeganMs = millis();
+                    m_lVar.no_host_timer = millis() + M3U8_EMPTY_PLAYLIST_BACKOFF_MS;
+                    // stalled= is the whole point of the line: it turns "the refetches
+                    // look sparser now" into a number. empty x backoff should track it.
+                    // stalled= — главное в этой строке: он превращает «выборки вроде
+                    // стали реже» в число. empty x backoff должно с ним сходиться.
+                    if(m_lVar.no_host_cnt == 2 || (m_lVar.no_host_cnt % 4) == 0) {
+                        Serial.printf("[AUDIO.HLS] playlist has no new segment, empty=%u stalled=%lums backoff=%ums\n",
+                                      (unsigned)m_lVar.no_host_cnt,
+                                      (unsigned long)(millis() - m_m3u8StallBeganMs),
+                                      (unsigned)M3U8_EMPTY_PLAYLIST_BACKOFF_MS);
+                    }
+
+                    // E-HL2: a stalled playlist must not look like playback. Polling it
+                    // forever leaves the UI on PLAYING with no audio - the outcome
+                    // rejected for the Ogg prebuffer in E-FL3, reached by another road.
+                    // The session is restarted from the master playlist rather than
+                    // stopped: on a CDN this stall is usually temporary, and a restart
+                    // renews the TLS connection and the playlist state machine.
+                    // It does NOT make already-played segments playable again:
+                    // m_playlistBuff, the URL of the last segment played, survives
+                    // setDefaults(), and replaying known segments would be audible
+                    // repetition rather than recovery. A playlist that only ever offers
+                    // known segments therefore burns the budget and ends in the terminal
+                    // stop below - which is the honest outcome.
+                    // The shared unstable-stream budget is reused, not duplicated: a
+                    // session restart is one physical connect attempt, which is exactly
+                    // one budget unit by the contract in audio_retry_budget.h. A dead
+                    // station therefore ends in an honest terminal stop instead of
+                    // reconnecting forever, and a station that recovers gets its budget
+                    // back from pollStreamStability().
+                    // E-HL2: замерший плейлист не должен выглядеть как воспроизведение.
+                    // Бесконечный опрос оставляет UI в PLAYING без звука — тот самый
+                    // исход, который забракован для Ogg-prebuffer в E-FL3, только другой
+                    // дорогой. Сессия перезапускается с мастер-плейлиста, а не
+                    // останавливается: на CDN такой простой обычно временный, и перезапуск
+                    // обновляет TLS-соединение и конечный автомат плейлиста.
+                    // Он НЕ делает уже проигранные сегменты пригодными снова:
+                    // m_playlistBuff — URL последнего проигранного сегмента — переживает
+                    // setDefaults(), а повтор известных сегментов был бы слышимым
+                    // повтором, а не восстановлением. Плейлист, отдающий только известные
+                    // сегменты, поэтому исчерпывает бюджет и заканчивается терминальной
+                    // остановкой ниже — это честный исход.
+                    // Общий бюджет нестабильного потока переиспользуется, а не дублируется:
+                    // перезапуск сессии — одна физическая попытка подключения, то есть
+                    // ровно одна единица бюджета по контракту audio_retry_budget.h.
+                    // Мёртвая станция поэтому заканчивается честной терминальной
+                    // остановкой, а восстановившаяся получает бюджет назад из
+                    // pollStreamStability().
+                    const uint32_t stalledMs = millis() - m_m3u8StallBeganMs;
+                    if(stalledMs >= M3U8_STALL_GIVEUP_MS && m_lastHost.valid()) {
+                        m_m3u8StallBeganMs = 0;
+                        m_lVar.no_host_cnt = 0;
+                        m_lVar.no_host_timer = millis();
+                        if(attemptInternalReconnect(true)) {
+                            Serial.printf("[AUDIO.HLS] playlist stalled %lums -> restart session retry=%u/%u\n",
+                                          (unsigned long)stalledMs,
+                                          (unsigned)m_unstableStreamFailures,
+                                          (unsigned)MAX_UNSTABLE_STREAM_FAILURES);
+                            connecttohost(m_lastHost.get());
+                        }
+                        else {
+                            Serial.printf("[AUDIO.HLS] playlist stalled %lums -> retry budget exhausted, terminal stop\n",
+                                          (unsigned long)stalledMs);
+                            finishUnstableStreamExhausted();
+                        }
+                        break;
+                    }
+                }
                 if(host.valid()) { // host contains the next playlist URL
                     httpPrint(host.get());
                     m_dataMode = HTTP_RESPONSE_HEADER;
@@ -4057,13 +5159,12 @@ void Audio::processWebStream() {
     uint16_t readedBytes = 0;
 
     m_pwst.maxFrameSize = InBuff.getMaxBlockSize(); // every mp3/aac frame is not bigger
-    m_pwst.availableBytes = 0; // available from stream
     m_pwst.f_clientIsConnected = m_client->connected();
+    m_pwst.availableBytes = m_client->available(); // buffered bytes can remain after peer close
 
-    if(!m_pwst.f_clientIsConnected && !m_f_tts) {
-        AUDIO_INFO("webstream disconnected -> stop running");
-        m_f_running = false;
-        return;
+    if(!m_pwst.f_clientIsConnected && !m_f_tts && !m_f_allDataReceived) {
+        scheduleWebstreamReconnect(m_pwst.f_clientIsConnected, m_pwst.availableBytes);
+        if(!m_pwst.availableBytes) return;
     }
 
     // first call, set some values to default  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -4076,9 +5177,10 @@ void Audio::processWebStream() {
         readMetadata(0, &readedBytes, true);
         getChunkSize(0, true);
         m_audioFilePosition = 0;
+        m_sdet.tmr_lost = millis() + WEBSTREAM_STALL_RECONNECT_MS;
+        m_sdet.cnt_lost = 0;
+        m_streamStartWaitBeganMs = millis();   // E-FL3
     }
-    if(m_pwst.f_clientIsConnected) m_pwst.availableBytes = m_client->available(); // available from stream
-
     // chunked data tramsfer
     if(m_f_chunked && m_pwst.availableBytes){
         if(m_pwst.chunkSize == 0) {
@@ -4113,16 +5215,81 @@ void Audio::processWebStream() {
     // buffer fill routine - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
     if(m_pwst.availableBytes) {
         m_pwst.availableBytes = min(m_pwst.availableBytes, (uint32_t)InBuff.writeSpace());
-        int32_t bytesAddedToBuffer = audioFileRead(InBuff.getWritePtr(), min(m_pwst.availableBytes, UINT16_MAX));
-        if(bytesAddedToBuffer > 0) {
-            if(m_f_metadata) m_metacount -= bytesAddedToBuffer;
-            if(m_f_chunked) m_pwst.chunkSize -= bytesAddedToBuffer;
-            InBuff.bytesWritten(bytesAddedToBuffer);
+        uint8_t* payloadWritePtr = InBuff.getWritePtr();
+        uint32_t payloadReadLimit = min(m_pwst.availableBytes, (uint32_t)UINT16_MAX);
+        if(m_f_aacOverlapActive && m_aacOverlapScanBytes < AAC_OVERLAP_SCAN_LIMIT_BYTES) {
+            payloadReadLimit = min(payloadReadLimit, AAC_OVERLAP_SCAN_LIMIT_BYTES - m_aacOverlapScanBytes);
+        }
+        int32_t bytesReadFromSocket = audioFileRead(payloadWritePtr, payloadReadLimit);
+        if(bytesReadFromSocket > 0) {
+            // ICY metadata and HTTP chunk framing have already been consumed.
+            // Protocol accounting follows every socket byte, while only the
+            // proven non-duplicate suffix is published to the decoder buffer.
+            if(m_f_metadata) m_metacount -= bytesReadFromSocket;
+            if(m_f_chunked) m_pwst.chunkSize -= bytesReadFromSocket;
+
+            const size_t bytesToBuffer = filterAacOverlapPayload(payloadWritePtr, bytesReadFromSocket);
+            if(bytesToBuffer) {
+                rememberAacWebstreamPayload(payloadWritePtr, bytesToBuffer);
+                InBuff.bytesWritten(bytesToBuffer);
+            }
         }
     }
 
     // start audio decoding - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-    if(InBuff.bufferFilled() > m_pwst.maxFrameSize && !m_f_stream) { // waiting for buffer filled
+    uint32_t streamStartThreshold = m_pwst.maxFrameSize;
+    if(m_codec == CODEC_AAC && !m_f_tts) streamStartThreshold = max(streamStartThreshold, AAC_WEBSTREAM_PREBUFFER_BYTES);
+    // E-FL2: an Ogg station is still CODEC_OGG at this point - the real codec is only
+    // resolved inside the branch below - so the gate must key on CODEC_OGG. Keying on
+    // CODEC_FLAC here would never fire.
+    // E-FL2: станция в Ogg здесь ещё CODEC_OGG — настоящий кодек определяется только
+    // внутри условия ниже, — поэтому проверять надо CODEC_OGG. Проверка на CODEC_FLAC
+    // не сработала бы никогда.
+    uint32_t oggPrebufferTarget = 0;
+    if(m_codec == CODEC_OGG && m_streamType == ST_WEBSTREAM &&
+       m_playlistFormat != FORMAT_M3U8 && !m_f_tts) {
+        oggPrebufferTarget = m_nominal_bitrate
+            ? (m_nominal_bitrate / 8) / 2            // ~0.5 s of audio
+            : OGG_WEBSTREAM_PREBUFFER_UNKNOWN_BYTES; // station announced no bitrate
+        oggPrebufferTarget = max(OGG_WEBSTREAM_PREBUFFER_MIN_BYTES,
+                                 min(oggPrebufferTarget, OGG_WEBSTREAM_PREBUFFER_MAX_BYTES));
+        streamStartThreshold = max(streamStartThreshold, oggPrebufferTarget);
+    }
+    // E-FL3: a prebuffer must not be able to wait forever. A server that hands over a
+    // short burst and then goes quiet without closing the socket leaves the target
+    // unreachable, and the station stays silent for good while the UI shows PLAYING.
+    // After the deadline the threshold falls back to the library's original
+    // maxFrameSize, so the worst case is the pre-prebuffer behaviour - play what
+    // arrived, then starve - instead of permanent silence. Lowering only, never raising.
+    // E-FL3: prebuffer не должен уметь ждать вечно. Сервер, отдавший короткий пакет и
+    // замолчавший, не закрывая сокет, делает порог недостижимым, и станция молчит
+    // навсегда, показывая в UI PLAYING. По истечении срока порог возвращается к
+    // исходному maxFrameSize библиотеки, и худший случай — поведение до prebuffer:
+    // играем то, что пришло, потом голодаем, — вместо вечной тишины. Порог только
+    // понижается, никогда не повышается.
+    if(!m_f_stream && m_streamStartWaitBeganMs && streamStartThreshold > m_pwst.maxFrameSize &&
+       (millis() - m_streamStartWaitBeganMs) >= STREAM_START_PREBUFFER_DEADLINE_MS &&
+       InBuff.bufferFilled() >= m_pwst.maxFrameSize) {
+        Serial.printf("[AUDIO.BUFFER] prebuffer deadline after %lums filled=%lu want=%lu -> start at %lu\n",
+                      (unsigned long)(millis() - m_streamStartWaitBeganMs),
+                      (unsigned long)InBuff.bufferFilled(),
+                      (unsigned long)streamStartThreshold,
+                      (unsigned long)m_pwst.maxFrameSize);
+        streamStartThreshold = m_pwst.maxFrameSize;
+        oggPrebufferTarget = 0;
+    }
+    if(InBuff.bufferFilled() >= streamStartThreshold && !m_f_stream) { // waiting for buffer filled
+        if(m_codec == CODEC_AAC && !m_f_tts) {
+            Serial.printf("[AUDIO.BUFFER] AAC prebuffer ready bytes=%lu target=%lu\n",
+                          (unsigned long)InBuff.bufferFilled(),
+                          (unsigned long)AAC_WEBSTREAM_PREBUFFER_BYTES);
+        }
+        if(oggPrebufferTarget) {
+            Serial.printf("[AUDIO.BUFFER] OGG prebuffer ready bytes=%lu target=%lu bitrate=%lu\n",
+                          (unsigned long)InBuff.bufferFilled(),
+                          (unsigned long)oggPrebufferTarget,
+                          (unsigned long)m_nominal_bitrate);
+        }
         if(m_codec == CODEC_OGG) { // AUDIO_INFO("determine correct codec here");
             uint8_t codec = determineOggCodec(InBuff.getReadPtr(), m_pwst.maxFrameSize);
             if(codec == CODEC_FLAC) {initializeDecoder(codec); m_codec = codec; AUDIO_INFO("format is flac");}
@@ -4130,6 +5297,7 @@ void Audio::processWebStream() {
             if(codec == CODEC_VORBIS) {initializeDecoder(codec); m_codec = codec; AUDIO_INFO("format is vorbis");}
         }
         AUDIO_INFO("stream ready");
+        m_streamStartWaitBeganMs = 0;   // E-FL3: not waiting any more
         m_f_stream = true;  // ready to play the audio data
     }
 
@@ -4479,6 +5647,7 @@ void Audio::processWebStreamHLS() {
 void Audio::playAudioData() {
 
     if(!m_f_stream || m_f_eof || m_f_lockInBuffer || !m_f_running){m_validSamples = 0; return;} // guard, stream not ready or eof reached or InBuff is locked or not running
+    if(m_f_audioTaskStopGate){m_validSamples = 0; return;}  // E-HO1: terminal stop pending
     if(m_validSamples) {playChunk();                                                   return;} // guard, play samples first
     //--------------------------------------------------------------------------------
     m_pad.count = 0;
@@ -4552,6 +5721,32 @@ exit:
     return;
 }
 //****************************************************************************************
+// E-HO2: the single controlled fallback for every way a buffered reconnect can
+// fail - bad header, incompatible response, failed redirect. The preserved stream
+// keeps its codec and its retained buffer; only the replacement transport is
+// dropped and a normal reconnect is scheduled. The live codec is not restored here
+// because it is never changed while preserving: the response is parsed into staging.
+// E-HO2: единственный контролируемый fallback на все способы провалить buffered
+// reconnect — плохой заголовок, несовместимый ответ, неудавшийся redirect.
+// Сохранённый поток удерживает свой кодек и свой буфер; сбрасывается только новый
+// транспорт и планируется обычный reconnect. Живой кодек здесь не восстанавливается,
+// потому что при preserve он не меняется: ответ разбирается в staging.
+void Audio::finishPreserveReconnectFallback() {
+    if(m_client->connected()) m_client->stop();
+    m_stagedCodec = CODEC_NONE;
+    m_stagedPlaylistFormat = FORMAT_NONE;
+    m_f_stagedOgg = false;
+    m_f_preserveStreamReconnect = false;
+    m_preservedStreamCodec = CODEC_NONE;
+    m_f_timeout = false;
+    resetAacOverlapDiagnostic(false);
+    m_dataMode = AUDIO_DATA;
+    m_streamType = ST_WEBSTREAM;
+    m_f_webstreamReconnectPending = true;
+    m_webstreamReconnectSession = m_playbackSession;
+    m_webstreamReconnectNextMs = millis() + WEBSTREAM_RECONNECT_BACKOFF_MS;
+}
+//****************************************************************************************
 bool Audio::parseHttpResponseHeader() { // this is the response to a GET / request
 
     if(m_dataMode != HTTP_RESPONSE_HEADER) return false;
@@ -4559,7 +5754,9 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
 
     memset(&m_phreh, 0, sizeof(m_phreh));
     m_phreh.ctime = millis();
-    m_phreh.timeout = 4500; // ms	(HEADER_TIMEOUT))
+    m_phreh.timeout = m_f_preserveStreamReconnect
+        ? BUFFERED_RECONNECT_HEADER_TIMEOUT_MS
+        : 4500; // ms (initial/clean HEADER_TIMEOUT)
 
     if(m_client->available() == 0) {
         if(!m_phreh.f_time) {
@@ -4632,7 +5829,16 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
         else if(rhl.starts_with_icase("content-type:")) { // content-type: text/html; charset=UTF-8
             int idx = rhl.index_of(';', 13);
             if(idx > 0) rhl[idx] = '\0';
-            if(parseContentType(rhl.get() + 13)) ct_seen = true;
+            // E-HO2: while the preserved buffer is still being decoded, the codec of
+            // the replacement response goes to staging. Writing m_codec here used to
+            // switch the running decoder mid-stream, before any compatibility check.
+            // E-HO2: пока доигрывается сохранённый буфер, кодек нового ответа идёт
+            // в staging. Запись m_codec здесь переключала работающий декодер на ходу,
+            // до какой-либо проверки совместимости.
+            const bool ctOk = m_f_preserveStreamReconnect
+                ? parseContentTypeInto(rhl.get() + 13, m_stagedCodec, m_f_stagedOgg, m_stagedPlaylistFormat)
+                : parseContentType(rhl.get() + 13);
+            if(ctOk) ct_seen = true;
             else{
                 /*AUDIO_LOG_WARN*/AUDIO_ERROR("unknown contentType %s", rhl.get() + 13);
                 goto exit;
@@ -4640,9 +5846,11 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
         }
 
         else if(rhl.starts_with_icase("location:")) {
-            int pos = rhl.index_of_icase("http", 0);
-            if(pos >= 0) {
-                const char* c_host = (rhl.get() + pos);
+            ps_ptr<char> redirect("redirect");
+            redirect.alloc(1024);
+            if(redirect.valid() && audio_safe::resolveRedirect(m_currentHost.c_get(), rhl.c_get() + 9,
+                                                               redirect.get(), redirect.size())) {
+                const char* c_host = redirect.c_get();
                 if(!m_currentHost.equals(c_host)) { // prevent a loop
                     int pos_slash = indexOf(c_host, "/", 9);
                     if(pos_slash > 9) {
@@ -4652,14 +5860,30 @@ bool Audio::parseHttpResponseHeader() { // this is the response to a GET / reque
                             //    m_lastHost.assign(c_host);
                                 m_f_m3u8data = true;
                             }
-                            httpPrint(c_host);
+                            if(!httpPrint(c_host) && m_f_preserveStreamReconnect) {   // E-HO2
+                                Serial.printf("[AUDIO.RETRY] buffered reconnect redirect failed session=%lu\n",
+                                              (unsigned long)m_playbackSession);
+                                finishPreserveReconnectFallback();
+                                return false;
+                            }
                             while(m_client->available()) audioFileRead(); // empty client buffer
                             return true;
                         }
                     }
                     AUDIO_INFO("redirect to new host \"%s\"", c_host);
                     m_f_reset_m3u8Codec = false;
-                    httpPrint(c_host);
+                    // E-HO2: while preserving, httpPrint() returns false instead of
+                    // calling stopSong(), so an unchecked call would leave the state
+                    // machine waiting on a connection that was never opened.
+                    // E-HO2: при preserve httpPrint() возвращает false вместо вызова
+                    // stopSong(), поэтому непроверенный вызов оставил бы конечный
+                    // автомат ждать соединение, которое не открывалось.
+                    if(!httpPrint(c_host) && m_f_preserveStreamReconnect) {
+                        Serial.printf("[AUDIO.RETRY] buffered reconnect redirect failed session=%lu\n",
+                                      (unsigned long)m_playbackSession);
+                        finishPreserveReconnectFallback();
+                        return false;
+                    }
                     return true;
                 }
             }
@@ -4791,12 +6015,87 @@ exit: // termination condition
 //        if(audio_icydescription) audio_icydescription("");
         if(audio_icyurl) audio_icyurl("");
 
+    if(m_f_preserveStreamReconnect) {
+        Serial.printf("[AUDIO.RETRY] buffered reconnect header failed session=%lu retry=%u/%u inbuf=%lu\n",
+                      (unsigned long)m_playbackSession,
+                      (unsigned)m_unstableStreamFailures,
+                      (unsigned)MAX_UNSTABLE_STREAM_FAILURES,
+                      (unsigned long)InBuff.bufferFilled());
+        finishPreserveReconnectFallback();
+        return false;
+    }
 
     m_dataMode = AUDIO_NONE;
     stopSong();
     return false;
 
 lastToDo:
+    // E-HO2: verification first, while m_codec, the decoder and InBuff's block size
+    // still belong to the stream the audio task is decoding. parseContentType wrote
+    // the new codec live and initializeDecoder ran before any check, so an
+    // incompatible response could switch the running decoder and free its buffers
+    // mid-decode. Only a response proven compatible is applied now; an incompatible
+    // one never reaches the live fields and goes to the controlled fallback.
+    // E-HO2: сначала проверка, пока m_codec, декодер и размер блока InBuff ещё
+    // принадлежат потоку, который декодирует аудиозадача. Раньше parseContentType
+    // писал новый кодек в живое поле, а initializeDecoder отрабатывал до всякой
+    // проверки, поэтому несовместимый ответ мог переключить работающий декодер и
+    // освободить его буферы прямо во время декодирования. Теперь применяется только
+    // доказанно совместимый ответ, а несовместимый до живых полей не доходит и
+    // уходит в контролируемый fallback.
+    if(m_f_preserveStreamReconnect) {
+        uint8_t stagedStreamType = ST_WEBSTREAM;
+        if(m_audioFileSize > 0) stagedStreamType = ST_WEBFILE;   // content length found
+        if(m_phreh.f_icy_data)  stagedStreamType = ST_WEBSTREAM;
+        const bool compatible = (stagedStreamType == ST_WEBSTREAM) &&
+                                (m_stagedPlaylistFormat == FORMAT_NONE) &&
+                                (m_preservedStreamCodec != CODEC_NONE) &&
+                                (m_stagedCodec == m_preservedStreamCodec);
+        m_stagedCodec = CODEC_NONE;
+        m_stagedPlaylistFormat = FORMAT_NONE;
+        m_f_stagedOgg = false;
+        if(!compatible) {
+            Serial.printf("[AUDIO.RETRY] buffered reconnect rejected stream_type=%s(%u) codec=%s(%u) expected_codec=%s(%u) playlist=%u session=%lu\n",
+                          streamTypeStr[stagedStreamType], (unsigned)stagedStreamType,
+                          codecname[m_codec], (unsigned)m_codec,
+                          codecname[m_preservedStreamCodec], (unsigned)m_preservedStreamCodec,
+                          (unsigned)m_playlistFormat,
+                          (unsigned long)m_playbackSession);
+            finishPreserveReconnectFallback();
+            return false;
+        }
+        // Compatible: the live codec was never changed and its decoder is allocated
+        // and running, so initializeDecoder() is deliberately not called - it would
+        // free buffers the audio task is using. Only the stream framing is applied.
+        // Совместимо: живой кодек не менялся, его декодер выделен и работает,
+        // поэтому initializeDecoder() намеренно не вызывается — он освободил бы
+        // буферы, которыми пользуется аудиозадача. Применяется только обвязка потока.
+        m_dataMode = AUDIO_DATA;
+        m_streamType = ST_WEBSTREAM;
+        m_metacount = m_metaint;
+        m_rmet.pos_ml = 0;
+        m_rmet.metaDataSize = 0;
+        m_rmet.res = 0;
+        m_pwst.chunkSize = 0;
+        m_pwst.readedBytes = 0;
+        m_sdet.tmr_lost = millis() + WEBSTREAM_STALL_RECONNECT_MS;
+        m_sdet.cnt_lost = 0;
+        startAacOverlapDiagnostic();
+        m_f_preserveStreamReconnect = false;
+        m_preservedStreamCodec = CODEC_NONE;
+        m_f_bufferedReconnectPcmWatch = overlapDedupEligibleCodec();   // E-MP4
+        m_bufferedReconnectPcmSession = m_playbackSession;
+        m_bufferedReconnectPcmStartedMs = millis();
+        Serial.printf("[AUDIO.RETRY] reconnect succeeded %u/%u session=%lu buffered=1 inbuf=%lu socket_available=%lu\n",
+                      (unsigned)m_unstableStreamFailures,
+                      (unsigned)MAX_UNSTABLE_STREAM_FAILURES,
+                      (unsigned long)m_playbackSession,
+                      (unsigned long)InBuff.bufferFilled(),
+                      (unsigned long)m_client->available());
+        /*AUDIO_LOG_DEBUG*/AUDIO_INFO("playlistFormat %s, dataMode %s, streamType: %s", plsFmtStr[m_playlistFormat], dataModeStr[m_dataMode], streamTypeStr[m_streamType]);
+        return true;
+    }
+
     m_streamType = ST_WEBSTREAM;
     if(m_audioFileSize > 0)          m_streamType = ST_WEBFILE;  // content length found
     if(m_phreh.f_icy_data)           m_streamType = ST_WEBSTREAM;
@@ -4985,12 +6284,16 @@ exit:
 //****************************************************************************************
 // clang-format off
 bool Audio::parseContentType(char* ct) {
+    return parseContentTypeInto(ct, m_codec, m_f_ogg, m_playlistFormat);
+}
+//****************************************************************************************
+bool Audio::parseContentTypeInto(char* ct, uint8_t& codec, bool& isOgg, uint8_t& plsFmt) {
     enum : int { CT_NONE, CT_MP3, CT_AAC, CT_M4A, CT_WAV, CT_FLAC, CT_PLS, CT_M3U, CT_ASX, CT_M3U8, CT_TXT, CT_AACP, CT_OPUS, CT_OGG, CT_VORBIS };
 
     strlower(ct);
     trim(ct);
 
-    m_codec = CODEC_NONE;
+    codec = CODEC_NONE;
     int ct_val = CT_NONE;
 
     if(!strcmp(ct, "audio/mpeg")) ct_val = CT_MP3;
@@ -5045,63 +6348,63 @@ bool Audio::parseContentType(char* ct) {
     else { ; }
     switch(ct_val) {
         case CT_MP3:
-            m_codec = CODEC_MP3;
+            codec = CODEC_MP3;
             // { AUDIO_INFO("ContentType %s, format is mp3", ct); } // ok is likely mp3
             AUDIO_INFO("format is mp3");
             break;
         case CT_AAC:
-            m_codec = CODEC_AAC;
+            codec = CODEC_AAC;
             // { AUDIO_INFO("ContentType %s, format is aac", ct); }
             AUDIO_INFO("format is aac");
             break;
         case CT_M4A:
-            m_codec = CODEC_M4A;
+            codec = CODEC_M4A;
             // { AUDIO_INFO("ContentType %s, format is aac", ct); }
             AUDIO_INFO("format is aac");
             break;
         case CT_FLAC:
-            m_codec = CODEC_FLAC;
+            codec = CODEC_FLAC;
             // { AUDIO_INFO("ContentType %s, format is flac", ct); }
             AUDIO_INFO("format is flac");
             break;
         case CT_OPUS:
-            m_codec = CODEC_OPUS;
-            m_f_ogg = true; // opus is ogg
+            codec = CODEC_OPUS;
+            isOgg = true; // opus is ogg
             // { AUDIO_INFO("ContentType %s, format is opus", ct); }
             AUDIO_INFO("format is opus");
             break;
         case CT_VORBIS:
-            m_codec = CODEC_VORBIS;
-            m_f_ogg = true; // vorbis is ogg
+            codec = CODEC_VORBIS;
+            isOgg = true; // vorbis is ogg
             // { AUDIO_INFO("ContentType %s, format is vorbis", ct); }
             AUDIO_INFO("format is vorbis");
             break;
         case CT_WAV:
-            m_codec = CODEC_WAV;
+            codec = CODEC_WAV;
             // { AUDIO_INFO("ContentType %s, format is wav", ct); }
             AUDIO_INFO("format is wav");
             break;
         case CT_OGG:
-            m_codec = CODEC_OGG; AUDIO_INFO("format is ogg"); 	 // determine in first OGG packet -OPUS, VORBIS, FLAC
-            m_f_ogg = true; // maybe flac or opus or vorbis
+            codec = CODEC_OGG; AUDIO_INFO("format is ogg"); 	 // determine in first OGG packet -OPUS, VORBIS, FLAC
+            isOgg = true; // maybe flac or opus or vorbis
             break;
-        case CT_PLS: m_playlistFormat = FORMAT_PLS; break;
-        case CT_M3U: m_playlistFormat = FORMAT_M3U; break;
-        case CT_ASX: m_playlistFormat = FORMAT_ASX; break;
-        case CT_M3U8: m_playlistFormat = FORMAT_M3U8; break;
+        case CT_PLS: plsFmt = FORMAT_PLS; break;
+        case CT_M3U: plsFmt = FORMAT_M3U; break;
+        case CT_ASX: plsFmt = FORMAT_ASX; break;
+        case CT_M3U8: plsFmt = FORMAT_M3U8; break;
         case CT_TXT: // overwrite text/plain
             if(m_expectedCodec == CODEC_AAC) {
-                m_codec = CODEC_AAC; AUDIO_INFO("format is aac"); /* AUDIO_INFO("set ct from M3U8 to AAC");*/ }
+                codec = CODEC_AAC; AUDIO_INFO("format is aac"); /* AUDIO_INFO("set ct from M3U8 to AAC");*/ }
             if(m_expectedCodec == CODEC_MP3) {
-                m_codec = CODEC_MP3; AUDIO_INFO("format is mp3"); /* AUDIO_INFO("set ct from M3U8 to MP3");*/ }
+                codec = CODEC_MP3; AUDIO_INFO("format is mp3"); /* AUDIO_INFO("set ct from M3U8 to MP3");*/ }
             if(m_expectedPlsFmt == FORMAT_ASX) {
-                m_playlistFormat = FORMAT_ASX;  /* AUDIO_INFO("set playlist format to ASX");*/ }
+                plsFmt = FORMAT_ASX;  /* AUDIO_INFO("set playlist format to ASX");*/ }
             if(m_expectedPlsFmt == FORMAT_M3U) {
-                m_playlistFormat = FORMAT_M3U;  /* AUDIO_INFO("set playlist format to M3U");*/ }
+                plsFmt = FORMAT_M3U;  /* AUDIO_INFO("set playlist format to M3U");*/ }
             if(m_expectedPlsFmt == FORMAT_M3U8) {
-                m_playlistFormat = FORMAT_M3U8; /* AUDIO_INFO("set playlist format to M3U8");*/ }
+                plsFmt = FORMAT_M3U8; /* AUDIO_INFO("set playlist format to M3U8");*/ }
             if(m_expectedPlsFmt == FORMAT_PLS) {
-                m_playlistFormat = FORMAT_PLS; /* AUDIO_INFO("set playlist format to PLS");*/ }
+                plsFmt = FORMAT_PLS; /* AUDIO_INFO("set playlist format to PLS");*/ }
             break;
         default:
             AUDIO_ERROR("%s, unsupported audio format", ct);
@@ -5174,12 +6477,8 @@ void Audio::showstreamtitle(char* ml) {
     }
 
     else if(indexOf(ml, "StreamTitle='") == 0){
-        titleStart = 13;
-        idx2 = indexOf(ml, ";", 12);
-        if(idx2 > titleStart + 1){
-            titleLen = idx2 - 1 - titleStart;
-            streamTitle.assign(ml + 13, titleLen);
-        }
+        const audio_safe::TextSlice value = audio_safe::streamTitleValue(ml);
+        if(value.valid && value.length > 0) streamTitle.assign(value.data, value.length);
     }
 
     else if(startsWith(ml, "#EXTINF")){
@@ -5350,6 +6649,16 @@ int Audio::findNextSync(uint8_t* data, size_t len) {
     if(m_codec == CODEC_VORBIS) {
         m_fnsy.nextSync = VORBISFindSyncWord(data, len);
         if(m_fnsy.nextSync == -1) return len; // OggS not found, search next block
+        // E-VS4: same treatment MP3 already gets above. Losing sync mid-page leaves a
+        // stale Ogg segment table behind; without this the realigned parser reads the
+        // next page header as audio and can walk into header parsing on garbage.
+        // The codebooks are kept, so audio resumes on the next page with no gap.
+        // E-VS4: то же, что выше уже делает MP3. Потеря синхронизации посреди страницы
+        // оставляет устаревшую таблицу сегментов Ogg; без сброса выровненный парсер
+        // примет заголовок следующей страницы за аудио и может уйти в разбор
+        // заголовков по мусору. Кодбуки сохраняются, поэтому звук продолжится со
+        // следующей страницы без разрыва.
+        VORBISDecoder_ClearBuffers();
     }
     if(m_fnsy.nextSync == -1) {
         if(m_fnsy.swnf == 0) { AUDIO_INFO("syncword not found"); }
@@ -5433,11 +6742,11 @@ void Audio::setDecoderItems() {
     }
     if(getBitsPerSample() != 8 && getBitsPerSample() != 16) {
         AUDIO_ERROR("Bits per sample must be 8 or 16, found %i", getBitsPerSample());
-        stopSong();
+        requestStopFromAudioTask("bits per sample");   // E-ST1
     }
     if(getChannels() != 1 && getChannels() != 2) {
         AUDIO_ERROR("Num of channels must be 1 or 2, found %i", getChannels());
-        stopSong();
+        requestStopFromAudioTask("channel count");     // E-ST1
     }
     memset(m_filterBuff, 0, sizeof(m_filterBuff)); // Clear FilterBuffer
     IIR_calculateCoefficients(m_gain0, m_gain1, m_gain2); // must be recalculated after each samplerate change
@@ -5446,7 +6755,13 @@ void Audio::setDecoderItems() {
 //****************************************************************************************
 uint32_t Audio::decodeError(int8_t res, uint8_t* data, int32_t bytesDecoded){
         // for(int i = 0; i < 10; i++){printf("0x%02X ", data[i]);} printf("\n");
-        if(res == -100){stopSong(); return bytesDecoded;} // serious error, e.g. decoder could not be initialized
+        // E-ST1: this runs on the audio task - ask, do not stop. FLAC_STOP is -100, so
+        // a station that keeps failing to decode used to close the socket from here
+        // while the player task was reading it.
+        // E-ST1: выполняется в аудиозадаче — просим, а не останавливаем. FLAC_STOP это
+        // -100, поэтому станция с постоянными ошибками декодирования закрывала отсюда
+        // сокет, пока задача Player из него читала.
+        if(res == -100){requestStopFromAudioTask("decoder fatal"); return bytesDecoded;}
         if(m_codec == CODEC_AAC && res == -21){ // mono <-> stereo change
             //  According to the specification, the channel configuration is transferred in the first ADTS header and no longer changes in the entire
             //  stream. Some streams send short mono blocks in a stereo stream. e.g. http://mp3.ffh.de/ffhchannels/soundtrack.aac
@@ -5480,6 +6795,12 @@ uint32_t Audio::decodeContinue(int8_t res, uint8_t* data, int32_t bytesDecoded){
 //****************************************************************************************
 int Audio::sendBytes(uint8_t* data, size_t len) {
     if(!m_f_running) return 0; // guard
+    // E-HO1: m_f_playing = false would only make the block below resync and resume.
+    // This gate is what actually stops decoding until the owner task acts.
+    // E-HO1: m_f_playing = false заставил бы блок ниже лишь пересинхронизироваться
+    // и продолжить. Реально останавливает декодирование до реакции владельца
+    // именно этот затвор.
+    if(m_f_audioTaskStopGate) return 0;
     m_sbyt.bytesLeft = 0;
     m_sbyt.nextSync = 0;
 
@@ -5510,7 +6831,7 @@ int Audio::sendBytes(uint8_t* data, size_t len) {
         case CODEC_VORBIS: res = VORBISDecode(data, &m_sbyt.bytesLeft, m_outBuff.get()); break;
         default: {
             AUDIO_ERROR("no valid codec found codec = %d", m_codec);
-            stopSong();
+            requestStopFromAudioTask("no valid codec");   // E-ST1
         }
     }
     bytesDecoded = len - m_sbyt.bytesLeft;
@@ -5521,6 +6842,34 @@ int Audio::sendBytes(uint8_t* data, size_t len) {
     //        < 0: there has been an error
     //       -100: serious error, stop song
 
+    // E-VS3: a rejected Vorbis setup header is not a frame-level glitch - without the
+    // codebook/floor/residue tables the decoder cannot produce a single sample, and the
+    // next header chain may be a whole track away. Re-open the stream instead: the
+    // server always sends the header chain on connect. Recovery is handed to the
+    // EXISTING webstream reconnect, so the retry budget, the session guard, the manual
+    // STOP priority and the terminal-stop contract all stay exactly as they are - no
+    // second retry mechanism is introduced. The flag is read one-shot, and
+    // scheduleWebstreamReconnect() ignores repeat calls while one is already pending.
+    // E-VS3: отвергнутый setup-заголовок Vorbis - не сбой отдельного кадра: без таблиц
+    // codebook/floor/residue декодер не выдаст ни одного сэмпла, а следующая цепочка
+    // заголовков может прийти лишь через трек. Поэтому переоткрываем поток: сервер
+    // всегда отдаёт заголовки при подключении. Восстановление отдаётся СУЩЕСТВУЮЩЕМУ
+    // механизму reconnect, поэтому бюджет попыток, session guard, приоритет ручного
+    // STOP и terminal-stop contract не меняются - второй механизм retry не вводится.
+    // Флаг читается одноразово, а scheduleWebstreamReconnect() игнорирует повторные
+    // вызовы, пока предыдущий ещё не отработал.
+    // E-VS7: sendBytes() runs on the audio task; the socket is read and written by
+    // Audio::loop() on the player task, and the two share no mutex on this path.
+    // Closing the client here raced with its owner. Publish the request plus the
+    // session it belongs to and let the owner task act on it.
+    // E-VS7: sendBytes() выполняется в аудиозадаче, а сокет читает и пишет
+    // Audio::loop() в задаче Player, и общего мьютекса на этом пути у них нет.
+    // Закрытие клиента отсюда конфликтовало с владельцем. Публикуем запрос вместе
+    // с сессией, к которой он относится, и отдаём исполнение задаче-владельцу.
+    if(res < 0 && m_codec == CODEC_VORBIS && m_streamType == ST_WEBSTREAM &&
+       VORBISConsumeSetupHeaderFailure()) {
+        requestVorbisReopenFromAudioTask();
+    }
     if(res <  0){ return decodeError(res, data, bytesDecoded);} // Error, skip the frame...
     if(res > 99){ return decodeContinue(res, data, bytesDecoded);} // decoder needs more data...
 
@@ -6919,28 +8268,45 @@ exit:
 boolean Audio::streamDetection(uint32_t bytesAvail) {
     if(!m_lastHost.valid()) {AUDIO_ERROR("m_lastHost is empty"); return false;}
 
+    const uint32_t now = millis();
+
     // if within one second the content of the audio buffer falls below the size of an audio frame 100 times,
     // issue a message
-    if(m_sdet.tmr_slow + 1000 < millis()) {
-        m_sdet.tmr_slow = millis();
+    if(m_sdet.tmr_slow + 1000 < now) {
+        m_sdet.tmr_slow = now;
         if(m_sdet.cnt_slow > 100) AUDIO_INFO("slow stream, dropouts are possible");
         m_sdet.cnt_slow = 0;
     }
     if(InBuff.bufferFilled() < InBuff.getMaxBlockSize()) m_sdet.cnt_slow++;
     if(bytesAvail) {
-        m_sdet.tmr_lost = millis() + 1000;
+        m_sdet.tmr_lost = now + WEBSTREAM_STALL_RECONNECT_MS;
         m_sdet.cnt_lost = 0;
     }
+
+    // Sending another GET on an existing live socket makes the header parser consume audio data.
+    // Reconnect regular webstreams through the bounded scheduler only after the original
+    // five-second near-empty-buffer test below. Burst-fed AAC sockets legitimately have
+    // one-second delivery gaps while remaining connected and must not be stopped here.
+    const bool regularWebstream = m_playlistFormat != FORMAT_M3U8 &&
+                                  m_streamType == ST_WEBSTREAM &&
+                                  !m_f_tts && !m_f_allDataReceived;
+
     if(InBuff.bufferFilled() > InBuff.getMaxBlockSize() * 2) return false; // enough data available to play
 
-    // if no audio data is received within three seconds, a new connection attempt is started.
-    if(m_sdet.tmr_lost < millis()) {
+    // if no audio data is received for five seconds while the buffer is nearly empty,
+    // a new connection attempt is started.
+    if(m_sdet.tmr_lost < now) {
         m_sdet.cnt_lost++;
-        m_sdet.tmr_lost = millis() + 1000;
+        m_sdet.tmr_lost = now + 1000;
         if(m_sdet.cnt_lost == 5) { // 5s no data?
             m_sdet.cnt_lost = 0;
             AUDIO_INFO("Stream lost -> try new connection");
             m_f_reset_m3u8Codec = false;
+            if(regularWebstream) {
+                if(m_client->connected()) m_client->stop();
+                scheduleWebstreamReconnect(false, 0);
+                return true;
+            }
             if (!attemptInternalReconnect()) {
                 finishUnstableStreamExhausted();
                 return false;
@@ -7159,6 +8525,13 @@ void Audio::audioTask() {
 //****************************************************************************************
 void Audio::performAudioTask() {
     if(!m_f_running) return;
+    // E-HO1: a terminal stop has been requested and not yet executed by the owner.
+    // Drop the already decoded PCM instead of playing it out - nothing more of this
+    // stream may reach I2S.
+    // E-HO1: terminal stop запрошен и ещё не выполнен владельцем. Сбрасываем уже
+    // декодированный PCM вместо доигрывания — ничего из этого потока больше не
+    // должно попасть в I2S.
+    if(m_f_audioTaskStopGate) {m_validSamples = 0; return;}
     if(!m_f_stream) return;
     if(m_codec == CODEC_NONE) return; // wait for codec is  set
     if(m_codec == CODEC_OGG)  return; // wait for FLAC, VORBIS or OPUS

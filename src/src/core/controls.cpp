@@ -6,15 +6,16 @@
 #include "display.h"
 #include "network.h"
 #include "netserver.h"
+#include "sleep_timer.h"
 
 long encOldPosition  = 0;
 long enc2OldPosition  = 0;
 int lpId = -1;
 
-#define ISPUSHBUTTONS BTN_LEFT!=255 || BTN_CENTER!=255 || BTN_RIGHT!=255 || ENC_BTNB!=255 || BTN_UP!=255 || BTN_DOWN!=255 || ENC2_BTNB!=255 || BTN_MODE!=255
+#define ISPUSHBUTTONS BTN_LEFT!=255 || BTN_CENTER!=255 || BTN_RIGHT!=255 || ENC_BTNB!=255 || BTN_UP!=255 || BTN_DOWN!=255 || ENC2_BTNB!=255 || BTN_MODE!=255 || BTN_MUTE!=255
 #if ISPUSHBUTTONS
 #include "../OneButton/OneButton.h"
-OneButton button[] {{BTN_LEFT, true, BTN_INTERNALPULLUP}, {BTN_CENTER, true, BTN_INTERNALPULLUP}, {BTN_RIGHT, true, BTN_INTERNALPULLUP}, {ENC_BTNB, true, ENC_INTERNALPULLUP}, {BTN_UP, true, BTN_INTERNALPULLUP}, {BTN_DOWN, true, BTN_INTERNALPULLUP}, {ENC2_BTNB, true, ENC2_INTERNALPULLUP}, {BTN_MODE, true, BTN_INTERNALPULLUP}};
+OneButton button[] {{BTN_LEFT, true, BTN_INTERNALPULLUP}, {BTN_CENTER, true, BTN_INTERNALPULLUP}, {BTN_RIGHT, true, BTN_INTERNALPULLUP}, {ENC_BTNB, true, ENC_INTERNALPULLUP}, {BTN_UP, true, BTN_INTERNALPULLUP}, {BTN_DOWN, true, BTN_INTERNALPULLUP}, {ENC2_BTNB, true, ENC2_INTERNALPULLUP}, {BTN_MODE, true, BTN_INTERNALPULLUP}, {BTN_MUTE, true, BTN_INTERNALPULLUP}};
 constexpr uint8_t nrOfButtons = sizeof(button) / sizeof(button[0]);
 #endif
 
@@ -98,7 +99,7 @@ void initControls() {
 #if ISPUSHBUTTONS
   for (int i = 0; i < nrOfButtons; i++)
   {
-    if ((i == 0 && BTN_LEFT == 255) || (i == 1 && BTN_CENTER == 255) || (i == 2 && BTN_RIGHT == 255) || (i == 3 && ENC_BTNB == 255) || (i == 4 && BTN_UP == 255) || (i == 5 && BTN_DOWN == 255) || (i == 6 && ENC2_BTNB == 255) || (i == 7 && BTN_MODE == 255)) continue;
+    if ((i == 0 && BTN_LEFT == 255) || (i == 1 && BTN_CENTER == 255) || (i == 2 && BTN_RIGHT == 255) || (i == 3 && ENC_BTNB == 255) || (i == 4 && BTN_UP == 255) || (i == 5 && BTN_DOWN == 255) || (i == 6 && ENC2_BTNB == 255) || (i == 7 && BTN_MODE == 255) || (i == 8 && BTN_MUTE == 255)) continue;
     button[i].attachClick([](void* p) {
       onBtnClick((int)p);
     }, (void*)i);
@@ -150,7 +151,7 @@ void loopControls() {
 #if ISPUSHBUTTONS
   for (unsigned i = 0; i < nrOfButtons; i++)
   {
-    if ((i == 0 && BTN_LEFT == 255) || (i == 1 && BTN_CENTER == 255) || (i == 2 && BTN_RIGHT == 255) || (i == 3 && ENC_BTNB == 255) || (i == 4 && BTN_UP == 255) || (i == 5 && BTN_DOWN == 255) || (i == 6 && ENC2_BTNB == 255)) continue;
+    if ((i == 0 && BTN_LEFT == 255) || (i == 1 && BTN_CENTER == 255) || (i == 2 && BTN_RIGHT == 255) || (i == 3 && ENC_BTNB == 255) || (i == 4 && BTN_UP == 255) || (i == 5 && BTN_DOWN == 255) || (i == 6 && ENC2_BTNB == 255) || (i == 8 && BTN_MUTE == 255)) continue;
     button[i].tick();
     if (lpId >= 0) {
       onBtnDuringLongPress(lpId);
@@ -430,7 +431,9 @@ void onBtnLongPressStop(int id) {
         break;
       }
     case EVT_BTNMODE: {
-        config.doSleepW();
+        // Long-press Mode uses the same queued managed immediate request as UI/telnet.
+        // Long-press Mode идёт через тот же queued managed request, без обходного sleep path.
+        timer_request_deep_sleep_now(DeepSleepWakeRequest::persistent());
         break;
       }
     default:
@@ -561,6 +564,22 @@ void onBtnClick(int id) {
       break;
     }
     #endif
+    case EVT_BTNMUTE: {
+        // Screensaver keeps its wake-first contract: the first press only wakes, as for the
+        // centre button above; the mute toggle needs a second, deliberate press.
+        // Скринсейвер сохраняет контракт "первое нажатие только будит": как у центральной
+        // кнопки выше; само переключение MUTE - по второму, осознанному нажатию.
+        if (display.mode() == SCREENSAVER || display.mode() == SCREENBLANK) {
+          display.putRequest(NEWMODE, PLAYER);
+          config.screensaverTicks=SCREENSAVERSTARTUPDELAY;
+          config.screensaverPlayingTicks=SCREENSAVERSTARTUPDELAY;
+          break;
+        }
+        // One semantic action, delivered through the player queue - no direct codec/LVGL touch here.
+        // Одно семантическое действие через очередь плеера - без прямого доступа к кодеку/LVGL.
+        player.requestMute(PMUTE_TOGGLE);
+        break;
+      }
     default: break;
   }
 }

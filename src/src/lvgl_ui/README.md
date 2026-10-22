@@ -5,7 +5,7 @@ Author: Witaliy76 - https://github.com/Witaliy76
 All LVGL-related product UI lives exclusively in `src/src/lvgl_ui/`.
 Do not mix LVGL screen/widget code with legacy drivers in `src/src/displays/`.
 
-This directory hosts the LVGL 8.3 UI for YoRadio: PageChain navigation, product
+This directory hosts the LVGL 9.5.0 UI for YoRadio: PageChain navigation, product
 screens, shared widgets, display profiles, theme, adapters, and assets.
 All `lv_*` calls run only on **DspTask** (via `Display::loop` / `lvgl_ui` entry points).
 Cross-task UI updates arrive through `display.putRequest()` and are applied on DspTask.
@@ -28,7 +28,7 @@ Info <-> Main <-> Visual <-> Station <-> Weather <-> Settings
 | 2 | Visual | Beocord-style stereo PPM on real pre-Gain PCM + stream metadata |
 | 3 | Station | Station list (default: simple paged renderer) |
 | 4 | Weather | Current weather + forecast from shared `WeatherState` |
-| 5 | Settings | Display, theme, Auto Dim, Sleep Timer, Music Rail, Wi-Fi service entry |
+| 5 | Settings | Display, theme, Auto Dim, TIMERS (Radio Stop/Start + Deep Sleep/Wake), Music Rail, Wi-Fi service entry |
 
 Special modes (not carousel slots):
 
@@ -44,7 +44,7 @@ Special modes (not carousel slots):
 
 ```
 lvgl_ui/
-├── lv_conf.h                 - LVGL 8.3 compile-time configuration
+├── lv_conf.h                 - LVGL 9.5.0 compile-time configuration
 ├── lvgl_ui.h / lvgl_ui.cpp   - Public entry points and lifecycle integration
 ├── lv_page_chain.*           - Carousel + Boot / Temporary / Wi-Fi special modes
 ├── lv_screen.h               - ILvglScreen contract
@@ -59,7 +59,7 @@ lvgl_ui/
 ├── adapters/                 - preset store, station list boundary
 ├── theme/                    - Dark / Light / Custom + THEME.md
 ├── assets/                   - Boot / screensaver assets
-└── fonts/                    - Generated LVGL fonts (do not hand-edit .c)
+└── fonts/                    - factory + Tabler TTF, emergency 16, see readme_fonts.md
 ```
 
 ## Runtime ownership
@@ -67,11 +67,71 @@ lvgl_ui/
 | Concern | Owner |
 |---------|--------|
 | `lv_*` API | DspTask only |
-| Framebuffer / flush | Display pipeline (Canvas path until later rendering stages) |
-| Theme preset / Custom file | Theme module + WebUI Appearance; live reapply on DspTask |
-| Station art / Main backgrounds | LittleFS + Main reload hooks on DspTask |
+| Display / draw buffer | LVGL 9 `lv_display_t`; RGB565; one 480x160 PSRAM buffer (153600 B) in `LV_DISPLAY_RENDER_MODE_PARTIAL` on 4848S040 |
+| Flush | Synchronous LVGL -> DisplayPort -> direct `esp_lcd`/ST7701 path; CPU rectangular blit from the 480x160 draw buffer into one 480x480 PSRAM physical framebuffer; `lv_display_flush_ready()` exactly once on every callback path |
+| Touch | GT911 registered as an LVGL 9 pointer indev; its read callback runs from `lv_timer_handler()` on DspTask |
+| LVGL heap | Fixed 256 KiB built-in TLSF pool backed by one process-lifetime PSRAM allocation |
+| LVGL task stack | DspTask, 12288 B |
+| Theme preset / Custom file | Theme module + WebUI Appearance; coalesced live reapply on DspTask |
+| Station art / Main backgrounds | Main: LittleFS JPEG decoded on the `MainBgJpeg` worker into an RGB565 PSRAM cache; cache install and LVGL apply on DspTask. Station art: LittleFS RGB565 `.bin` |
 | Weather data | Core `WeatherState` (fetch off UI); Weather page is read-only consumer |
 | Presets | `adapters/preset_store` on LittleFS |
+
+`lvgl_ui::initRuntime()` initializes LVGL and registers the custom `lv_fs_drv_t`
+LittleFS bridge as drive `L:`. `initDisplayDriver()` creates the display, installs the
+buffer and flush callback, initializes the theme, and registers the pointer indev.
+`taskHandler()` is the DspTask-owned LVGL pump.
+
+PageChain loads the next carousel screen with LVGL 9 screen auto-delete semantics.
+Before a previous tree is deleted, `prepareForAutoDelete()` stops page-owned resources
+that could still touch LVGL objects; after deletion, `releaseAfterAutoDelete()` clears
+handles and releases non-LVGL resources. A gesture callback installed on an active screen
+root must not synchronously load another screen: `carousel_gesture_event_cb` records the
+direction, and `taskHandler()` consumes it only after `lv_timer_handler()` returns and the
+LVGL event-dispatch stack has unwound. Some child callbacks still navigate synchronously;
+they are safe in the current object/event layout and remain a defensive hardening follow-up.
+
+Runtime theme changes follow the same request-now / apply-later rule, for the same reason. A
+Theme tap (or a WebUI `SET_THEME_PRESET` message) only records the requested preset;
+`taskHandler()` then runs the heavy transaction - LVGL default-theme reinit, global style
+refresh, page reapply and `theme.dat` persistence - at most once, for the newest request, on a
+quiet iteration. Intermediate presets in a rapid burst are discarded, so the burst costs one
+apply instead of one per tap. Settings reads the requested preset (`themeRequestedPreset()`) so
+the row follows the user immediately, while `yoradio_theme_active_preset()` keeps meaning the
+preset actually in effect for every other consumer.
+
+Main backgrounds are factory/user JPEGs decoded by TJPGD, FIT/ScaleOnce into an RGB565
+PSRAM cache. Both Boot preparation and runtime theme changes go through the same single
+`MainBgJpeg` worker (core 0, priority 1) with its latest-wins generation counter and
+user→factory fallback; DspTask never decodes inline. That matters on Boot: `lv_timer_handler()`
+has one call site, so a synchronous decode would hold DspTask outside it and freeze the Boot
+shuttle animation — with the worker, DspTask keeps servicing LVGL and the indicator stays
+animated for the whole decode/scale. The indicator remains genuinely indeterminate; there is no
+progress metric to report. Boot still hands off to Main only once the preparation attempt has
+settled, and settlement means *attempted*, not *succeeded* — a decode failure with no usable
+fallback lets Main continue exactly as before, showing the theme-colored screen.
+`mainBgCachePollApply()` (via `mainBgPollRuntimeApply()`) is the sole consumer of a finished
+worker result and the only place the cache is installed. Visual and screensaver RGB565 `.bin` files keep the existing YoRadio
+4-byte little-endian disk header followed by RGB565 bytes. Loaders translate that header
+to an in-memory LVGL 9 `lv_image_header_t` / `lv_image_dsc_t`; those families were not
+converted to a new disk format. Static RGB565A8 screensaver sprites are different: they use the
+LVGL 9 color-plane-then-alpha-plane representation. Normal text and icons are two
+embedded TTF assets opened by TinyTTF (`fonts/readme_fonts.md`), plus an optional
+LittleFS `/fonts/user.ttf` for normal text only. The compiled
+`lv_font_yora_montserrat_16_cyr` emergency face remains LVGL 9 `fmt_txt` ABI.
+
+## Fonts
+
+Ordinary firmware uses TinyTTF, not a per-size compiled C ladder.
+
+| Asset | Role |
+|-------|------|
+| `fonts/yoradio_factory_font.ttf` | multilingual factory text; `FontProvider::text(px)` when no valid user file |
+| LittleFS `/fonts/user.ttf` | optional user text TTF (runtime, PSRAM copy, 512 KiB cap, reboot to apply) |
+| `fonts/yoradio_tabler.ttf` | 34-glyph Tabler subset; `FontProvider::icon(px)` |
+| `fonts/lv_font_yora_montserrat_16_cyr.c` | emergency 16 px only |
+
+Pixel size is a runtime request. Current S3 glyph cache policy is text **P64** and icons **P8**. There is no production font prewarm. A normal PlatformIO build embeds the two TTF files (`board_build.embed_files`) and does **not** run fontTools. Optional user text is **not** embedded: it is uploaded through WebUI Appearance to `/fonts/user.ttf`. SHA256 and coverage: [`fonts/readme_fonts.md`](fonts/readme_fonts.md).
 
 ## Related tracked docs
 
@@ -79,4 +139,4 @@ lvgl_ui/
 - Screensaver layout: [`lv_screensaver_layout_tree.md`](lv_screensaver_layout_tree.md)
 - Per-screen layout trees: `screens/*_layout_tree.md`
 - Boot logo notes: [`screens/bootlogo.md`](screens/bootlogo.md)
-- Localization (compile-time RU/EN/PL): [`../i18n/LOCALIZATION.md`](../i18n/LOCALIZATION.md)
+- Localization (compile-time RU/EN/PL/SK): [`../i18n/LOCALIZATION.md`](../i18n/LOCALIZATION.md)

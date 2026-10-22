@@ -143,7 +143,7 @@ Left gutter: accent (3) | gap (5) | marker (32) | gap (5) | text
 **SimplePaged (STATIONPAGED-GEOM-A):** row metrics from real font + target pitch (keep 8 rows):
 
 ```
-line_height = lv_font_get_line_height(montserrat_22_cyr)   // currently 27
+line_height = lv_font_get_line_height(FontProvider::text(22))   // 22 px factory TTF; currently 27
 target_pitch = 41
 line_space   = target_pitch - line_height                  // currently 14
 row_pitch    = line_height + line_space                    // 41
@@ -177,7 +177,7 @@ Paged: row Y = `local_row × row_pitch` (page-local). Legacy: document Y = `(sta
 | `update()` | status only | — |
 | `exit()` | no-op | — |
 | `liveReapplyTheme()` | recolor chrome + dividers | `liveReapplyTheme(_list, pal)` |
-| `destroy()` | `lv_obj_del(_screen)` | `releaseAfterTreeDelete(_list)` in `_nullHandles` |
+| `destroy()` | `lv_obj_delete(_screen)` | `releaseAfterTreeDelete(_list)` in `_nullHandles` |
 | `releaseAfterAutoDelete()` | `_nullHandles` | `releaseAfterTreeDelete` |
 
 `refreshCurrentStationVisuals()` on page: count label + `station_list_active::refreshCurrentStationVisuals(_list)` — no page jump (paged) / no scroll jump (legacy) on NEWSTATION.

@@ -5,11 +5,6 @@
 
 #include "config.h"
 
-// W-R1B: coordinate-save diagnostics gate — off by default.
-// W-R1B: гейт диагностики сохранения координат — выключен по умолчанию.
-#ifndef YORADIO_WEATHER_REQ_DIAG
-#define YORADIO_WEATHER_REQ_DIAG 0
-#endif
 #include "save_manager.h"
 #include "player.h"
 #include "telnet.h"
@@ -18,13 +13,21 @@
 #include "network.h"
 #include "mqtt.h"
 #include "controls.h"
+#include "sleep_timer.h"
 #include <Update.h>
 #include <ESPmDNS.h>
 #include <ArduinoJson.h>
 #include "../lvgl_ui/profiles/lv_profile_select.h"
 #include "../lvgl_ui/theme/lv_theme_yoradio.h"
+#include "../lvgl_ui/main_bg_jpeg.h"
+#include "../lvgl_ui/font_provider.h"
+#include "user_ttf.h"
 #include "../ai/ai_subsystem.h"
 #include "../ai/ai_log.h"  // AI Layer logging macros
+
+namespace {
+void bgTryFinalizePending();
+}
 
 // Forward declarations for AI config functions from config.cpp / Forward объявления для функций AI config из config.cpp
 // AIConfig structure is now defined in config.h (included above)
@@ -74,6 +77,10 @@ void handleUploadArt(AsyncWebServerRequest *request, String filename, size_t ind
 void handleRemoveArtHttp(AsyncWebServerRequest *request);
 void handleArtStatusHttp(AsyncWebServerRequest *request);
 void handleBgStatusHttp(AsyncWebServerRequest *request);
+void beginUploadUserFont(AsyncWebServerRequest *request);
+void handleUploadUserFont(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final);
+void handleRemoveUserFontHttp(AsyncWebServerRequest *request);
+void handleUserFontStatusHttp(AsyncWebServerRequest *request);
 
 bool  shouldReboot  = false;
 #ifdef MQTT_ROOT_TOPIC
@@ -172,7 +179,11 @@ bool NetServer::begin(bool quiet) {
   webserver.on("/update", HTTP_POST, beginUpdate, handleUpdate);
   webserver.on("/settings", HTTP_GET, handleHTTPArgs);
   webserver.on("/appearance", HTTP_GET, handleHTTPArgs);
-  // Main background .bin → /bg/main_{dark,light,custom}.bin (Stage 6.1F-d) / Фон Main в слоты LittleFS
+  webserver.on("/upload_font", HTTP_POST, beginUploadUserFont, handleUploadUserFont);
+  webserver.on("/remove_font", HTTP_POST, handleRemoveUserFontHttp);
+  webserver.on("/font_status", HTTP_GET, handleUserFontStatusHttp);
+  // Main background JPEG → /bg/user_{dark,light,custom}.jpg (factory /bg/main_*.jpg immutable)
+  // Фон Main: пользовательский JPEG; заводские /bg/main_*.jpg не перезаписываются.
   webserver.on("/upload_bg", HTTP_POST, beginUploadBg, handleUploadBg);
   webserver.on("/remove_bg", HTTP_POST, handleRemoveBgHttp);
   // Stage 6.6R-B: runtime theme preset switch (enqueues SET_THEME_PRESET on DspTask; no LVGL here)
@@ -192,6 +203,10 @@ bool NetServer::begin(bool quiet) {
   webserver.onNotFound([](AsyncWebServerRequest* request) {
     if (request->method() == HTTP_GET && request->url() == "/bg_status") {
       handleBgStatusHttp(request);
+      return;
+    }
+    if (request->method() == HTTP_GET && request->url() == "/font_status") {
+      handleUserFontStatusHttp(request);
       return;
     }
     request->send(404, "text/plain", "Not found");
@@ -269,6 +284,11 @@ void NetServer::beginUpload(AsyncWebServerRequest *request) {
     netserver.importRequest = IMWIFI;
     request->send(200);
   } else {
+    // Neither import will run, so nothing downstream will close the window that handleUpload()
+    // opened when it purged the playlist pair and wrote /data/tmp. Close it here.
+    // Ни один импорт не запустится, и закрыть окно, открытое handleUpload() при удалении пары
+    // playlist/index и записи /data/tmp, больше некому. Закрываем здесь.
+    display.requestRgbResync();
     request->send(404);
   }
 }
@@ -454,10 +474,18 @@ void NetServer::processQueue(){
         }
         #endif
         if(config.getMode()==PM_WEB){
-          config.indexPlaylist(); 
-          config.initPlaylist(); 
+          config.indexPlaylist();
+          config.initPlaylist();
         }
-        getPlaylist(clientId); break;
+        getPlaylist(clientId);
+        // Latest boundary of the playlist import window: the playlist file was written by
+        // importPlaylist(), and index.dat has now been rebuilt and re-read. One resync for the
+        // whole import, not per station and not between the playlist and index files.
+        // Крайняя граница окна импорта плейлиста: файл плейлиста записан в importPlaylist(),
+        // index.dat перестроен и перечитан. Один ресинхрон на весь импорт, не по станциям и не
+        // между файлами плейлиста и индекса.
+        display.requestRgbResync();
+        break;
       }
       case GETACTIVE: {
           bool dbgact = false;
@@ -588,7 +616,7 @@ void NetServer::processQueue(){
       case ITEM:          wsbufFormat( "{\"current\": %d}", config.lastStation()); break;
       case TITLE:         wsbufFormat( "{\"meta\": \"%s\"}", config.station.title); telnet.printf("##CLI.META#: %s\n> ", config.station.title); break;
       case PLAYER_ERROR:  wsbufFormat( "{\"player_error\": \"%s\"}", player.lastError()); break;
-      case VOLUME:        wsbufFormat( "{\"vol\": %d}", config.store.volume); telnet.printf("##CLI.VOL#: %d\n", config.store.volume); break;
+      case VOLUME:        wsbufFormat( "{\"vol\": %d}", player.audibleVolume()); telnet.printf("##CLI.VOL#: %d\n", player.audibleVolume()); break;
       case NRSSI:         wsbufFormat( "{\"rssi\": %d}", rssi); /*rssi = 255;*/ break;
       case SDPOS:         wsbufFormat( "{\"sdpos\": %d,\"sdend\": %d,\"sdtpos\": %d,\"sdtend\": %d}", 
                                   player.getFilePos(), 
@@ -628,6 +656,7 @@ void NetServer::loop() {
     sm::systemRestart();
   }
   websocket.cleanupClients();
+  bgTryFinalizePending();
   switch (importRequest) {
     case IMPL:    importPlaylist();  importRequest = IMDONE; break;
     case IMWIFI:  config.saveWifi(); importRequest = IMDONE; break;
@@ -712,10 +741,9 @@ void NetServer::onWsMessage(void *arg, uint8_t *data, size_t len, uint8_t client
         return;
       }
       if (strcmp(cmd, "invertdisplay") == 0) {
-        // Wi-Fi 3B: dev/test entry — same WebUI/API cmd "invertdisplay", opens LVGL Wi-Fi shell; no invert, no NVS write (DspTask via queue).
-        // Wi‑Fi 3B: временный вход в Wi‑Fi shell через тот же invertdisplay; без invert и без сохранения в store.
-        (void)val;
-        display.putRequest(NEWMODE, WIFI);
+        bool valb = static_cast<bool>(atoi(val));
+        config.saveValue(&config.store.invertdisplay, valb);
+        display.invert();
         return;
       }
       if (strcmp(cmd, "numplaylist") == 0) {
@@ -870,20 +898,10 @@ void NetServer::onWsMessage(void *arg, uint8_t *data, size_t len, uint8_t client
       }
       if (strcmp(cmd, "lat") == 0) {
         config.saveValue(config.store.weatherlat, val, 10, false);
-#if YORADIO_WEATHER_REQ_DIAG
-        Serial.printf("[WEATHER_CFG] save field=lat value=\"%s\"\n", val);
-        Serial.printf("[WEATHER_CFG] stored lat=\"%s\" lon=\"%s\"\n",
-                      config.store.weatherlat, config.store.weatherlon);
-#endif
         return;
       }
       if (strcmp(cmd, "lon") == 0) {
         config.saveValue(config.store.weatherlon, val, 10, false);
-#if YORADIO_WEATHER_REQ_DIAG
-        Serial.printf("[WEATHER_CFG] save field=lon value=\"%s\"\n", val);
-        Serial.printf("[WEATHER_CFG] stored lat=\"%s\" lon=\"%s\"\n",
-                      config.store.weatherlat, config.store.weatherlon);
-#endif
         return;
       }
       if (strcmp(cmd, "key") == 0) {
@@ -899,11 +917,6 @@ void NetServer::onWsMessage(void *arg, uint8_t *data, size_t len, uint8_t client
         if (config.store.showweather && strlen(config.store.weatherkey) > 0) {
           network.forceWeatherRefreshFromUi();
         }
-#if YORADIO_WEATHER_REQ_DIAG
-        Serial.printf("[WEATHER_CFG] apply refresh_requested=%d lat=\"%s\" lon=\"%s\"\n",
-                      (config.store.showweather && strlen(config.store.weatherkey) > 0) ? 1 : 0,
-                      config.store.weatherlat, config.store.weatherlon);
-#endif
         return;
       }
       // AI settings commands / Команды настроек AI
@@ -1223,6 +1236,15 @@ uint8_t NetServer::_readPlaylistLine(File &file, char * line, size_t size){
 }
 
 bool NetServer::importPlaylist() {
+  // handleUpload() already deleted the old playlist/index pair and wrote /data/tmp before this
+  // runs, so the hazard exists on entry — including the paths that abandon the import. When the
+  // import succeeds, PLAYLISTSAVED closes the window after the index rebuild instead.
+  // handleUpload() до этого уже удалил старую пару playlist/index и записал /data/tmp, поэтому
+  // окно существует уже на входе — включая пути отказа. При успехе окно закрывает PLAYLISTSAVED
+  // после перестроения индекса.
+  RgbResyncTransaction resync;
+  resync.markFsMutated();
+
   if(config.getMode()==PM_SDCARD) return false;
   File tempfile = LittleFS.open(TMP_PATH, "r");
   if (!tempfile) {
@@ -1235,6 +1257,7 @@ bool NetServer::importPlaylist() {
     tempfile.close();
     LittleFS.rename(TMP_PATH, PLAYLIST_PATH);
     requestOnChange(PLAYLISTSAVED, 0);
+    resync.deferToDisplayEvent();
     return true;
   }
   if (config.parseJSON(linePl, sName, sUrl, sOvol)) {
@@ -1253,6 +1276,7 @@ bool NetServer::importPlaylist() {
     tempfile.close();
     LittleFS.remove(TMP_PATH);
     requestOnChange(PLAYLISTSAVED, 0);
+    resync.deferToDisplayEvent();
     return true;
   }
   tempfile.close();
@@ -1298,14 +1322,17 @@ void NetServer::resetQueue(){
 }
 
 // ---------------------------------------------------------------------------
-// Stage 6.1F-d: Main background slots — POST /upload_bg, GET /bg_status
-// Слоты фона Main: загрузка .bin в /bg/main_*.bin, JSON статус для WebUI
+// Main background slots — POST /upload_bg, POST /remove_bg, GET /bg_status
+// User JPEG: /bg/user_{dark,light,custom}.jpg (factory /bg/main_*.jpg never overwritten)
+// Слоты фона: пользовательский JPEG; заводские /bg/main_*.jpg не перезаписываются.
 // ---------------------------------------------------------------------------
 namespace {
 
 static const char kBgTmpPath[] = "/bg/.upload_bg.tmp";
+static constexpr size_t kBgJpegMaxBytes = 1024u * 1024u; // canonical WebUI JPEG / канонический JPEG WebUI
 
-// LVGL 8.x lv_img_header_t (4 bytes LE) / Заголовок изображения LVGL 8.x
+// YoRadio on-disk image header (4 bytes LE; Station Art / Visual / Screensaver .bin, not Main).
+// Заголовок изображения на диске (4 байта LE; арт/Visual/Screensaver, не Main).
 static bool bgParseImgHeader(const uint8_t* b, uint8_t* outCf, uint16_t* outW, uint16_t* outH) {
   uint32_t v = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
   uint8_t az = (uint8_t)((v >> 5) & 7u);
@@ -1317,9 +1344,6 @@ static bool bgParseImgHeader(const uint8_t* b, uint8_t* outCf, uint16_t* outW, u
   *outH = (uint16_t)((v >> 21) & 0x7FFu);
   return true;
 }
-
-// LV_IMG_CF_TRUE_COLOR — LVGL 8.x color format for RGB565 image data
-static constexpr uint8_t kLvImgCfTrueColor = 4;
 
 static bool gBgUploadArmed = false;
 static char gBgDestPath[40] = {0};
@@ -1339,25 +1363,126 @@ static bool bgPrepareSlotForUpload(AsyncWebServerRequest* request) {
   }
   String slot = request->getParam("slot")->value();
   if (slot == "dark") {
-    strlcpy(gBgDestPath, "/bg/main_dark.bin", sizeof(gBgDestPath));
+    strlcpy(gBgDestPath, "/bg/user_dark.jpg", sizeof(gBgDestPath));
   } else if (slot == "light") {
-    strlcpy(gBgDestPath, "/bg/main_light.bin", sizeof(gBgDestPath));
+    strlcpy(gBgDestPath, "/bg/user_light.jpg", sizeof(gBgDestPath));
   } else if (slot == "custom") {
-    strlcpy(gBgDestPath, "/bg/main_custom.bin", sizeof(gBgDestPath));
+    strlcpy(gBgDestPath, "/bg/user_custom.jpg", sizeof(gBgDestPath));
   } else {
     request->send(400, "application/json", "{\"ok\":false,\"error\":\"bad_slot\"}");
     return false;
   }
   strlcpy(gBgSlotName, slot.c_str(), sizeof(gBgSlotName));
-  uint32_t w = LV_ACTIVE_PROFILE.width;
-  uint32_t h = LV_ACTIVE_PROFILE.height;
-  gBgExpectedSize = 4u + (size_t)w * (size_t)h * 2u;
+  gBgExpectedSize = kBgJpegMaxBytes;
   size_t freeB = LittleFS.totalBytes() - LittleFS.usedBytes();
-  if (freeB < gBgExpectedSize + 4096u) {
+  if (freeB < kBgJpegMaxBytes + 4096u) {
     request->send(507, "application/json", "{\"ok\":false,\"error\":\"insufficient_space\"}");
     return false;
   }
   return true;
+}
+
+struct BgFsPending {
+  bool valid = false;
+  bool is_remove = false;
+  char tmp[40] = {};
+  char dest[40] = {};
+  char slotName[12] = {};
+  uint8_t slot = 255;
+  size_t size = 0;
+};
+
+static BgFsPending s_bgPend;
+
+struct BgSourceFdTryLock {
+  bool owned = false;
+  BgSourceFdTryLock() { owned = lvgl_ui::mainBgTryLockSourceFd(); }
+  ~BgSourceFdTryLock() {
+    if (owned) {
+      lvgl_ui::mainBgUnlockSourceFd();
+    }
+  }
+  explicit operator bool() const { return owned; }
+  BgSourceFdTryLock(const BgSourceFdTryLock&) = delete;
+  BgSourceFdTryLock& operator=(const BgSourceFdTryLock&) = delete;
+};
+
+static uint8_t bgSlotIdFromName(const char* name) {
+  if (!name) return 255;
+  if (std::strcmp(name, "dark") == 0) return 0;
+  if (std::strcmp(name, "light") == 0) return 1;
+  if (std::strcmp(name, "custom") == 0) return 2;
+  return 255;
+}
+
+// Dest replace only after the JPEG worker has closed that path. / Замена dest только после close на worker.
+static bool bgInstallTmpToDest(const char* tmp, const char* dest) {
+  if (!tmp || !dest || dest[0] == '\0') return false;
+  if (LittleFS.exists(dest)) {
+    if (!LittleFS.remove(dest)) {
+      return false;
+    }
+  }
+  if (LittleFS.rename(tmp, dest)) {
+    return true;
+  }
+  File src = LittleFS.open(tmp, "r");
+  File dst = LittleFS.open(dest, "w");
+  if (!src || !dst) {
+    if (src) src.close();
+    if (dst) dst.close();
+    LittleFS.remove(tmp);
+    return false;
+  }
+  uint8_t buf[512];
+  bool ok = true;
+  while (src.available()) {
+    size_t rd = src.read(buf, sizeof(buf));
+    if (rd && dst.write(buf, rd) != rd) {
+      ok = false;
+      break;
+    }
+  }
+  src.close();
+  dst.close();
+  LittleFS.remove(tmp);
+  if (!ok) {
+    LittleFS.remove(dest);
+  }
+  return ok;
+}
+
+void bgTryFinalizePending() {
+  if (!s_bgPend.valid) return;
+  BgSourceFdTryLock fd;
+  if (!fd) return;
+  // Destination commit is its own persistence episode (RGB-RESYNC-ALL-RUNTIME-PERSISTENCE).
+  // An earlier HTTP tmp-write resync does not cover this remove/rename/copy.
+  // Коммит dest — отдельный эпизод персистентности; resync за tmp HTTP его не закрывает.
+  RgbResyncTransaction resync;
+  bool ok = true;
+  if (s_bgPend.is_remove) {
+    if (LittleFS.exists(s_bgPend.dest) && !LittleFS.remove(s_bgPend.dest)) {
+      ok = false;
+    }
+  } else {
+    ok = bgInstallTmpToDest(s_bgPend.tmp, s_bgPend.dest);
+  }
+  const uint8_t slot = s_bgPend.slot;
+  s_bgPend.valid = false;
+  s_bgPend.tmp[0] = '\0';
+  s_bgPend.dest[0] = '\0';
+  if (ok) {
+    resync.markFsMutated();
+    const uint8_t active = static_cast<uint8_t>(lvgl_ui::yoradio_theme_active_preset());
+    if (slot <= 2u && slot == active) {
+      display.putRequest(MAIN_BG_FS_UPDATED, static_cast<int>(slot));
+      resync.deferToDisplayEvent();
+    }
+    Serial.printf("[MAIN_BG] deferred FS commit ok slot=%u\n", (unsigned)slot);
+  } else {
+    Serial.printf("[MAIN_BG] deferred FS commit failed slot=%u\n", (unsigned)slot);
+  }
 }
 
 }  // namespace
@@ -1372,12 +1497,22 @@ void beginUploadBg(AsyncWebServerRequest* request) {
 void handleUploadBg(AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final) {
   (void)filename;
 
+  // Chunk invocations are NOT the transaction — the guard is only armed on the paths that end the
+  // upload (final chunk, or the fatal-IO exit), so a multi-chunk upload still yields one resync.
+  // Вызовы по чанкам — не транзакция: guard взводится только на завершающих путях, поэтому
+  // многочанковая загрузка даёт один ресинхрон.
+  RgbResyncTransaction resync;
+
   if (index == 0) {
     gBgUploadArmed = false;
     gBgIoFatal = false;
     gBgWrittenTotal = 0;
     if (gBgUploadFile) {
       gBgUploadFile.close();
+    }
+    if (s_bgPend.valid) {
+      request->send(409, "application/json", "{\"ok\":false,\"error\":\"busy\"}");
+      return;
     }
     if (!bgPrepareSlotForUpload(request)) {
       return;
@@ -1403,22 +1538,31 @@ void handleUploadBg(AsyncWebServerRequest* request, String filename, size_t inde
         gBgUploadFile.close();
       }
       LittleFS.remove(kBgTmpPath);
+      resync.markFsMutated();
       request->send(500, "application/json", "{\"ok\":false,\"error\":\"open_failed\"}");
     }
     return;
   }
 
   if (len && gBgUploadFile) {
-    size_t n = gBgUploadFile.write(data, len);
-    gBgWrittenTotal += n;
-    if (n != len) {
+    if (gBgWrittenTotal + len > kBgJpegMaxBytes) {
       gBgIoFatal = true;
+    } else {
+      size_t n = gBgUploadFile.write(data, len);
+      gBgWrittenTotal += n;
+      if (n != len) {
+        gBgIoFatal = true;
+      }
     }
   }
 
   if (!final) {
     return;
   }
+
+  // Final chunk: the temp file exists, so every exit from here owes one resync.
+  // Финальный чанк: временный файл создан, поэтому любой выход отсюда должен дать ресинхрон.
+  resync.markFsMutated();
 
   gBgUploadArmed = false;
   if (gBgUploadFile) {
@@ -1438,74 +1582,57 @@ void handleUploadBg(AsyncWebServerRequest* request, String filename, size_t inde
     return;
   }
   size_t sz = vf.size();
-  if (sz != gBgExpectedSize) {
+  if (sz == 0) {
     vf.close();
     LittleFS.remove(kBgTmpPath);
-    request->send(400, "application/json", "{\"ok\":false,\"error\":\"size_mismatch\"}");
+    request->send(400, "application/json", "{\"ok\":false,\"error\":\"empty\"}");
     return;
   }
-  uint8_t hdr[4];
-  if (vf.read(hdr, 4) != 4) {
+  if (sz > kBgJpegMaxBytes) {
     vf.close();
     LittleFS.remove(kBgTmpPath);
-    request->send(400, "application/json", "{\"ok\":false,\"error\":\"header_short\"}");
+    request->send(400, "application/json", "{\"ok\":false,\"error\":\"too_large\"}");
     return;
   }
-  uint8_t cf = 0;
-  uint16_t iw = 0;
-  uint16_t ih = 0;
-  if (!bgParseImgHeader(hdr, &cf, &iw, &ih)) {
+  uint8_t soi[3] = {0, 0, 0};
+  if (vf.read(soi, 2) != 2 || soi[0] != 0xFFu || soi[1] != 0xD8u) {
     vf.close();
     LittleFS.remove(kBgTmpPath);
-    request->send(400, "application/json", "{\"ok\":false,\"error\":\"bad_header\"}");
-    return;
-  }
-  if (cf != kLvImgCfTrueColor) {
-    vf.close();
-    LittleFS.remove(kBgTmpPath);
-    request->send(400, "application/json", "{\"ok\":false,\"error\":\"cf_not_true_color\"}");
-    return;
-  }
-  if (iw != LV_ACTIVE_PROFILE.width || ih != LV_ACTIVE_PROFILE.height) {
-    vf.close();
-    LittleFS.remove(kBgTmpPath);
-    request->send(400, "application/json", "{\"ok\":false,\"error\":\"dimensions_mismatch\"}");
+    request->send(400, "application/json", "{\"ok\":false,\"error\":\"not_jpeg\"}");
     return;
   }
   vf.close();
 
-  if (LittleFS.exists(gBgDestPath)) {
-    LittleFS.remove(gBgDestPath);
+  const uint8_t uploaded = bgSlotIdFromName(gBgSlotName);
+  if (s_bgPend.valid) {
+    LittleFS.remove(kBgTmpPath);
+    request->send(409, "application/json", "{\"ok\":false,\"error\":\"busy\"}");
+    return;
   }
-  if (!LittleFS.rename(kBgTmpPath, gBgDestPath)) {
-    File src = LittleFS.open(kBgTmpPath, "r");
-    File dst = LittleFS.open(gBgDestPath, "w");
-    if (!src || !dst) {
-      if (src) {
-        src.close();
-      }
-      if (dst) {
-        dst.close();
-      }
-      LittleFS.remove(kBgTmpPath);
+  {
+    BgSourceFdTryLock fd;
+    if (!fd) {
+      s_bgPend.valid = true;
+      s_bgPend.is_remove = false;
+      strlcpy(s_bgPend.tmp, kBgTmpPath, sizeof(s_bgPend.tmp));
+      strlcpy(s_bgPend.dest, gBgDestPath, sizeof(s_bgPend.dest));
+      strlcpy(s_bgPend.slotName, gBgSlotName, sizeof(s_bgPend.slotName));
+      s_bgPend.slot = uploaded;
+      s_bgPend.size = sz;
+      Serial.printf("[MAIN_BG] upload queued until source FD released (%s)\n", gBgDestPath);
+      char qjson[300];
+      snprintf(qjson, sizeof(qjson),
+               "{\"ok\":true,\"queued\":true,\"slot\":\"%s\",\"path\":\"%s\",\"written_bytes\":%lu,\"final_size\":0,\"target_exists\":false}",
+               gBgSlotName[0] ? gBgSlotName : "unknown",
+               gBgDestPath,
+               (unsigned long)gBgWrittenTotal);
+      request->send(200, "application/json", qjson);
+      return;
+    }
+    if (!bgInstallTmpToDest(kBgTmpPath, gBgDestPath)) {
       request->send(500, "application/json", "{\"ok\":false,\"error\":\"commit_failed\"}");
       return;
     }
-    uint8_t buf[512];
-    while (src.available()) {
-      size_t rd = src.read(buf, sizeof(buf));
-      if (rd && dst.write(buf, rd) != rd) {
-        src.close();
-        dst.close();
-        LittleFS.remove(kBgTmpPath);
-        LittleFS.remove(gBgDestPath);
-        request->send(500, "application/json", "{\"ok\":false,\"error\":\"commit_copy\"}");
-        return;
-      }
-    }
-    src.close();
-    dst.close();
-    LittleFS.remove(kBgTmpPath);
   }
   size_t final_sz = 0;
   bool target_exists = LittleFS.exists(gBgDestPath);
@@ -1516,22 +1643,11 @@ void handleUploadBg(AsyncWebServerRequest* request, String filename, size_t inde
       committed.close();
     }
   }
-  // Invalidate Main PSRAM bg when WebUI overwrote the active theme slot (DspTask reload).
-  // Сброс кэша фона: только если залитый слот совпадает с активным пресетом — иначе очередь не трогаем.
-  {
-    uint8_t uploaded = 255;
-    if (std::strcmp(gBgSlotName, "dark") == 0) {
-      uploaded = 0;
-    } else if (std::strcmp(gBgSlotName, "light") == 0) {
-      uploaded = 1;
-    } else if (std::strcmp(gBgSlotName, "custom") == 0) {
-      uploaded = 2;
-    }
-    if (uploaded <= 2u) {
-      const uint8_t active = static_cast<uint8_t>(lvgl_ui::yoradio_theme_active_preset());
-      if (uploaded == active) {
-        display.putRequest(MAIN_BG_FS_UPDATED, static_cast<int>(uploaded));
-      }
+  if (uploaded <= 2u) {
+    const uint8_t active = static_cast<uint8_t>(lvgl_ui::yoradio_theme_active_preset());
+    if (uploaded == active) {
+      display.putRequest(MAIN_BG_FS_UPDATED, static_cast<int>(uploaded));
+      resync.deferToDisplayEvent();
     }
   }
   char okjson[280];
@@ -1546,27 +1662,68 @@ void handleUploadBg(AsyncWebServerRequest* request, String filename, size_t inde
 }
 
 void handleRemoveBgHttp(AsyncWebServerRequest* request) {
-  // Delete slot file on LittleFS; missing file → ok / Удалить bin слота; нет файла → успех
+  // Delete user JPEG only; missing file → ok / Удалить только user JPEG; нет файла → успех
   if (!request->hasParam("slot")) {
     request->send(400, "application/json", "{\"ok\":false,\"error\":\"missing_slot\"}");
     return;
   }
   String slot = request->getParam("slot")->value();
   const char* path = nullptr;
+  uint8_t removed = 255;
   if (slot == "dark") {
-    path = "/bg/main_dark.bin";
+    path = "/bg/user_dark.jpg";
+    removed = 0;
   } else if (slot == "light") {
-    path = "/bg/main_light.bin";
+    path = "/bg/user_light.jpg";
+    removed = 1;
   } else if (slot == "custom") {
-    path = "/bg/main_custom.bin";
+    path = "/bg/user_custom.jpg";
+    removed = 2;
   } else {
     request->send(400, "application/json", "{\"ok\":false,\"error\":\"bad_slot\"}");
     return;
   }
+  // Delete now follows the same completion contract as upload: mutate, hand the slot to DspTask
+  // so the cached background is dropped and the default reapplied, and let that handler close the
+  // hazard window. A failed remove mutated nothing, so it owes no resync.
+  // Удаление следует тому же контракту завершения, что и загрузка: изменить ФС, передать слот в
+  // DspTask для сброса кэша и возврата к дефолту, и там закрыть окно. Неудавшийся remove ничего
+  // не изменил — ресинхрон не нужен.
+  RgbResyncTransaction resync;
+  bool deleted = false;
   if (LittleFS.exists(path)) {
+    if (s_bgPend.valid) {
+      request->send(409, "application/json", "{\"ok\":false,\"error\":\"busy\"}");
+      return;
+    }
+    BgSourceFdTryLock fd;
+    if (!fd) {
+      s_bgPend.valid = true;
+      s_bgPend.is_remove = true;
+      s_bgPend.tmp[0] = '\0';
+      strlcpy(s_bgPend.dest, path, sizeof(s_bgPend.dest));
+      strlcpy(s_bgPend.slotName, slot.c_str(), sizeof(s_bgPend.slotName));
+      s_bgPend.slot = removed;
+      s_bgPend.size = 0;
+      Serial.printf("[MAIN_BG] remove queued until source FD released (%s)\n", path);
+      request->send(200, "application/json", "{\"ok\":true,\"queued\":true}");
+      return;
+    }
     if (!LittleFS.remove(path)) {
       request->send(500, "application/json", "{\"ok\":false,\"error\":\"remove_failed\"}");
       return;
+    }
+    resync.markFsMutated();
+    deleted = true;
+  }
+  // Deleting an already-absent slot changes nothing, so it neither needs the reload nor owes a
+  // resync — only a real removal does.
+  // Удаление отсутствующего слота ничего не меняет: ни reload, ни ресинхрон не нужны.
+  if (deleted) {
+    const uint8_t active = static_cast<uint8_t>(lvgl_ui::yoradio_theme_active_preset());
+    if (removed == active) {
+      display.putRequest(MAIN_BG_FS_UPDATED, static_cast<int>(removed));
+      resync.deferToDisplayEvent();
     }
   }
   request->send(200, "application/json", "{\"ok\":true}");
@@ -1590,6 +1747,10 @@ void beginUploadTheme(AsyncWebServerRequest* request) {
 }
 
 void handleUploadTheme(AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final) {
+  // Armed only on the transaction-ending paths — see handleUploadBg.
+  // Взводится только на завершающих путях — см. handleUploadBg.
+  RgbResyncTransaction resync;
+
   if (index == 0) {
     gThemeUploadArmed = false;
     gThemeIoFatal = false;
@@ -1621,6 +1782,7 @@ void handleUploadTheme(AsyncWebServerRequest* request, String filename, size_t i
         gThemeUploadFile.close();
       }
       LittleFS.remove(kThemeCustomTmpPath);
+      resync.markFsMutated();
       request->send(500, "application/json", "{\"ok\":false,\"error\":\"open_failed\"}");
     }
     return;
@@ -1641,6 +1803,10 @@ void handleUploadTheme(AsyncWebServerRequest* request, String filename, size_t i
   if (!final) {
     return;
   }
+
+  // Final chunk: temp file exists, every exit from here owes one resync.
+  // Финальный чанк: временный файл создан, любой выход отсюда должен дать ресинхрон.
+  resync.markFsMutated();
 
   gThemeUploadArmed = false;
   if (gThemeUploadFile) {
@@ -1705,6 +1871,7 @@ void handleUploadTheme(AsyncWebServerRequest* request, String filename, size_t i
   // Stage 6.6R-F2: DspTask-only reload — NetServer does FS commit + queue (no palette parse here).
   // Этап 6.6R-F2: парсинг/палитра только в DspTask; stats — через GET /bg_status после reload.
   display.putRequest(CUSTOM_THEME_FILE_UPDATED, 0);
+  resync.deferToDisplayEvent();
 
   char okjson[256];
   snprintf(okjson, sizeof(okjson),
@@ -1725,6 +1892,261 @@ void handleRemoveThemeHttp(AsyncWebServerRequest* request) {
   display.putRequest(CUSTOM_THEME_FILE_UPDATED, 0);
   request->send(200, "application/json",
                  "{\"ok\":true,\"custom_theme_exists\":false,\"reload\":\"queued\"}");
+}
+
+// User text font — POST /upload_font, POST /remove_font, GET /font_status
+// Canonical /fonts/user.ttf; apply on reboot; no TinyTTF/lv_* here.
+// Пользовательский TTF: канонический путь; применение после reboot; без TinyTTF/lv_*.
+namespace {
+
+static bool gFontUploadArmed = false;
+static bool gFontIoFatal = false;
+static bool gFontTooLarge = false;
+static size_t gFontWrittenTotal = 0;
+static File gFontUploadFile;
+
+static bool fontInstallTmpToDest(const char* tmp, const char* dest) {
+  if (!tmp || !dest || dest[0] == '\0') return false;
+  if (LittleFS.exists(dest)) {
+    if (!LittleFS.remove(dest)) {
+      return false;
+    }
+  }
+  if (LittleFS.rename(tmp, dest)) {
+    return true;
+  }
+  File src = LittleFS.open(tmp, "r");
+  File dst = LittleFS.open(dest, "w");
+  if (!src || !dst) {
+    if (src) src.close();
+    if (dst) dst.close();
+    LittleFS.remove(tmp);
+    return false;
+  }
+  uint8_t buf[512];
+  bool ok = true;
+  while (src.available()) {
+    size_t rd = src.read(buf, sizeof(buf));
+    if (rd && dst.write(buf, rd) != rd) {
+      ok = false;
+      break;
+    }
+  }
+  src.close();
+  dst.close();
+  LittleFS.remove(tmp);
+  if (!ok) {
+    LittleFS.remove(dest);
+  }
+  return ok;
+}
+
+static bool fontLooksOtfName(const String& filename) {
+  const int dot = filename.lastIndexOf('.');
+  if (dot < 0) return false;
+  String ext = filename.substring(dot);
+  ext.toLowerCase();
+  return ext == ".otf" || ext == ".ttc" || ext == ".otc";
+}
+
+}  // namespace
+
+void beginUploadUserFont(AsyncWebServerRequest* request) {
+  (void)request;
+}
+
+void handleUploadUserFont(AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final) {
+  RgbResyncTransaction resync;
+
+  if (index == 0) {
+    gFontUploadArmed = false;
+    gFontIoFatal = false;
+    gFontTooLarge = false;
+    gFontWrittenTotal = 0;
+    if (gFontUploadFile) {
+      gFontUploadFile.close();
+    }
+    if (filename.length() > 0 && fontLooksOtfName(filename)) {
+      request->send(400, "application/json", "{\"ok\":false,\"error\":\"otf_not_supported\"}");
+      return;
+    }
+    const size_t freeB = LittleFS.totalBytes() - LittleFS.usedBytes();
+    if (freeB < yoradio::kUserTtfMaxBytes + 4096u) {
+      request->send(507, "application/json", "{\"ok\":false,\"error\":\"insufficient_space\"}");
+      return;
+    }
+    if (LittleFS.exists(yoradio::kUserTtfTmpPath)) {
+      LittleFS.remove(yoradio::kUserTtfTmpPath);
+    }
+    gFontUploadFile = LittleFS.open(yoradio::kUserTtfTmpPath, "w");
+    if (!gFontUploadFile) {
+      gFontIoFatal = true;
+    } else {
+      gFontUploadArmed = true;
+    }
+  } else if (!gFontUploadArmed) {
+    return;
+  }
+
+  if (gFontTooLarge) {
+    if (final) {
+      gFontUploadArmed = false;
+      if (gFontUploadFile) {
+        gFontUploadFile.close();
+      }
+      LittleFS.remove(yoradio::kUserTtfTmpPath);
+      resync.markFsMutated();
+      request->send(400, "application/json", "{\"ok\":false,\"error\":\"too_large\"}");
+    }
+    return;
+  }
+
+  if (gFontIoFatal) {
+    if (final) {
+      gFontUploadArmed = false;
+      if (gFontUploadFile) {
+        gFontUploadFile.close();
+      }
+      LittleFS.remove(yoradio::kUserTtfTmpPath);
+      resync.markFsMutated();
+      request->send(500, "application/json", "{\"ok\":false,\"error\":\"open_failed\"}");
+    }
+    return;
+  }
+
+  if (len && gFontUploadFile && !gFontTooLarge) {
+    if (gFontWrittenTotal + len > yoradio::kUserTtfMaxBytes) {
+      gFontTooLarge = true;
+    } else {
+      const size_t n = gFontUploadFile.write(data, len);
+      gFontWrittenTotal += n;
+      if (n != len) {
+        gFontIoFatal = true;
+      }
+    }
+  }
+
+  if (!final) {
+    return;
+  }
+
+  resync.markFsMutated();
+  gFontUploadArmed = false;
+  if (gFontUploadFile) {
+    gFontUploadFile.close();
+  }
+
+  if (gFontTooLarge) {
+    LittleFS.remove(yoradio::kUserTtfTmpPath);
+    request->send(400, "application/json", "{\"ok\":false,\"error\":\"too_large\"}");
+    return;
+  }
+  if (gFontIoFatal) {
+    LittleFS.remove(yoradio::kUserTtfTmpPath);
+    request->send(500, "application/json", "{\"ok\":false,\"error\":\"write_failed\"}");
+    gFontIoFatal = false;
+    return;
+  }
+
+  File vf = LittleFS.open(yoradio::kUserTtfTmpPath, "r");
+  if (!vf) {
+    LittleFS.remove(yoradio::kUserTtfTmpPath);
+    request->send(500, "application/json", "{\"ok\":false,\"error\":\"read_failed\"}");
+    return;
+  }
+  const size_t sz = static_cast<size_t>(vf.size());
+  if (sz == 0 || sz > yoradio::kUserTtfMaxBytes) {
+    vf.close();
+    LittleFS.remove(yoradio::kUserTtfTmpPath);
+    request->send(400, "application/json", "{\"ok\":false,\"error\":\"size_invalid\"}");
+    return;
+  }
+
+  uint8_t* buf = static_cast<uint8_t*>(ps_malloc(sz));
+  if (!buf) {
+    vf.close();
+    LittleFS.remove(yoradio::kUserTtfTmpPath);
+    request->send(500, "application/json", "{\"ok\":false,\"error\":\"psram_failed\"}");
+    return;
+  }
+  const int nread = vf.read(buf, sz);
+  vf.close();
+  yoradio::UserTtfReject why = yoradio::UserTtfReject::Io;
+  uint8_t hdr[12] = {};
+  if (nread >= 0 && static_cast<size_t>(nread) == sz) {
+    if (sz >= sizeof(hdr)) {
+      memcpy(hdr, buf, sizeof(hdr));
+    } else {
+      memcpy(hdr, buf, sz);
+    }
+    why = yoradio::user_ttf_validate(buf, sz);
+  }
+  free(buf);
+  if (why != yoradio::UserTtfReject::Ok) {
+    LittleFS.remove(yoradio::kUserTtfTmpPath);
+    char errjson[160];
+    snprintf(errjson, sizeof(errjson),
+             "{\"ok\":false,\"error\":\"invalid_ttf\",\"reason\":\"%s\"}",
+             yoradio::user_ttf_reject_cstr(why));
+    request->send(400, "application/json", errjson);
+    return;
+  }
+
+  if (!fontInstallTmpToDest(yoradio::kUserTtfTmpPath, yoradio::kUserTtfPath)) {
+    LittleFS.remove(yoradio::kUserTtfTmpPath);
+    request->send(500, "application/json", "{\"ok\":false,\"error\":\"commit_failed\"}");
+    return;
+  }
+
+  // Same Stage-5 coalesced path as MAIN_BG / theme: Display RGB_RESYNC → requestRuntimeRgbRecovery
+  // after lv_timer_handler (redraw then resync). Do not _performRgbResync here.
+  // Тот же Stage-5 путь, что MAIN_BG/theme: RGB_RESYNC → recovery после taskHandler. Не resync здесь.
+  lvgl_ui::FontProvider::notePersistedUserFile(true, static_cast<uint32_t>(sz), hdr);
+  display.putRequest(RGB_RESYNC);
+  resync.deferToDisplayEvent();
+
+  Serial.printf("[UserFont] uploaded bytes=%u; reboot required to apply\n",
+                static_cast<unsigned>(sz));
+  char okjson[240];
+  snprintf(okjson, sizeof(okjson),
+           "{\"ok\":true,\"path\":\"%s\",\"bytes\":%lu,\"reboot_required\":true}",
+           yoradio::kUserTtfPath, (unsigned long)sz);
+  request->send(200, "application/json", okjson);
+}
+
+void handleRemoveUserFontHttp(AsyncWebServerRequest* request) {
+  RgbResyncTransaction resync;
+  if (LittleFS.exists(yoradio::kUserTtfPath)) {
+    if (!LittleFS.remove(yoradio::kUserTtfPath)) {
+      request->send(500, "application/json", "{\"ok\":false,\"error\":\"remove_failed\"}");
+      return;
+    }
+    resync.markFsMutated();
+    static const uint8_t kZeroHdr[12] = {};
+    lvgl_ui::FontProvider::notePersistedUserFile(false, 0, kZeroHdr);
+    display.putRequest(RGB_RESYNC);
+    resync.deferToDisplayEvent();
+    Serial.println("[UserFont] removed; reboot required to apply factory text");
+  }
+  request->send(200, "application/json",
+               "{\"ok\":true,\"removed\":true,\"reboot_required\":true}");
+}
+
+void handleUserFontStatusHttp(AsyncWebServerRequest* request) {
+  const lvgl_ui::UserFontWebStatus st = lvgl_ui::FontProvider::userFontWebStatus();
+  char json[360];
+  snprintf(json, sizeof(json),
+           "{\"ok\":true,\"runtime\":\"%s\",\"provider_ready\":%s,\"file_present\":%s,"
+           "\"file_size\":%lu,\"reboot_required\":%s,\"max_bytes\":%lu,"
+           "\"path\":\"%s\",\"apply\":\"reboot_required\"}",
+           lvgl_ui::FontProvider::userFontRuntimeCstr(st.runtime),
+           st.provider_ready ? "true" : "false",
+           st.file_present ? "true" : "false",
+           (unsigned long)st.file_size,
+           st.reboot_required ? "true" : "false",
+           (unsigned long)yoradio::kUserTtfMaxBytes,
+           yoradio::kUserTtfPath);
+  request->send(200, "application/json", json);
 }
 
 // Stage 6.6R-B: POST /set_theme?preset=dark|light|custom — enqueue runtime preset switch on DspTask.
@@ -1754,7 +2176,7 @@ void handleSetThemeHttp(AsyncWebServerRequest* request) {
 
 void handleBgStatusHttp(AsyncWebServerRequest* request) {
   // Main background slots on LittleFS — read-only, defensive / Слоты фона Main, только чтение
-  static const char* const kBgPaths[3] = {"/bg/main_dark.bin", "/bg/main_light.bin", "/bg/main_custom.bin"};
+  static const char* const kBgPaths[3] = {"/bg/user_dark.jpg", "/bg/user_light.jpg", "/bg/user_custom.jpg"};
   bool bgOk[3] = {false, false, false};
   size_t bgSz[3] = {0, 0, 0};
   for (int i = 0; i < 3; i++) {
@@ -1801,6 +2223,7 @@ void handleBgStatusHttp(AsyncWebServerRequest* request) {
   snprintf(buf, sizeof(buf),
            "{\"dsp_w\":%u,\"dsp_h\":%u,"
            "\"active_theme\":\"%s\","
+           "\"bg_loading\":%s,"
            "\"bg_dark\":%s,\"bg_light\":%s,\"bg_custom\":%s,"
            "\"bg_dark_size\":%lu,\"bg_light_size\":%lu,\"bg_custom_size\":%lu,"
            "\"custom_theme_exists\":%s,"
@@ -1811,6 +2234,7 @@ void handleBgStatusHttp(AsyncWebServerRequest* request) {
            "\"custom_theme_unknown_keys\":%u}",
            (unsigned)dw, (unsigned)dh,
            active_theme,
+           lvgl_ui::mainBgCacheRuntimeBusy() ? "true" : "false",
            bgOk[0] ? "true" : "false",
            bgOk[1] ? "true" : "false",
            bgOk[2] ? "true" : "false",
@@ -1868,6 +2292,10 @@ void beginUploadArt(AsyncWebServerRequest* request) {
 void handleUploadArt(AsyncWebServerRequest* request, String filename, size_t index, uint8_t* data, size_t len, bool final) {
     (void)filename;
 
+    // Armed only on the transaction-ending paths — see handleUploadBg.
+    // Взводится только на завершающих путях — см. handleUploadBg.
+    RgbResyncTransaction resync;
+
     if (index == 0) {
         gArtUploadArmed = false;
         gArtIoFatal     = false;
@@ -1900,6 +2328,7 @@ void handleUploadArt(AsyncWebServerRequest* request, String filename, size_t ind
             gArtUploadArmed = false;
             if (gArtUploadFile) gArtUploadFile.close();
             LittleFS.remove(kArtTmpPath);
+            resync.markFsMutated();
             request->send(500, "application/json", "{\"ok\":false,\"error\":\"open_failed\"}");
         }
         return;
@@ -1912,6 +2341,10 @@ void handleUploadArt(AsyncWebServerRequest* request, String filename, size_t ind
     }
 
     if (!final) return;
+
+    // Final chunk: temp file exists, every exit from here owes one resync.
+    // Финальный чанк: временный файл создан, любой выход отсюда должен дать ресинхрон.
+    resync.markFsMutated();
 
     gArtUploadArmed = false;
     if (gArtUploadFile) gArtUploadFile.close();
@@ -1995,6 +2428,7 @@ void handleUploadArt(AsyncWebServerRequest* request, String filename, size_t ind
 
     // Signal DspTask to reload art on Main screen / Сигнал DspTask — перезагрузить арт на Main.
     display.putRequest(ART_FS_UPDATED, 0);
+    resync.deferToDisplayEvent();
 
     char okjson[320];
     snprintf(okjson, sizeof(okjson),
@@ -2285,6 +2719,13 @@ void handleUploadWeb(AsyncWebServerRequest *request, String filename, size_t ind
   const bool is_prompt_file = webUploadIsAiPromptBasename(base);
   
   if (is_prompt_file) {
+    // One resync per prompt upload attempt, armed on the paths that end it — success and every
+    // abort that already touched /ai/ai_prompt.{tmp,bak,txt}. A rolled-back prompt still moved
+    // flash blocks, so an HTTP 500 does not excuse the scanout.
+    // Один ресинхрон на попытку загрузки промпта, взводится на завершающих путях — и успех, и
+    // любой обрыв, уже тронувший /ai/ai_prompt.{tmp,bak,txt}. Откат тоже двигал блоки flash.
+    RgbResyncTransaction resync;
+
     // Get max prompt size from ai_prompt module / Получить максимальный размер промпта из модуля ai_prompt
     extern size_t aiPromptGetMaxLen();
     size_t max_prompt_size = aiPromptGetMaxLen();
@@ -2326,6 +2767,7 @@ void handleUploadWeb(AsyncWebServerRequest *request, String filename, size_t ind
       
       if (freeSpace < max_prompt_size) {
         AI_LOG("[AI] Upload rejected: insufficient FS space (free=%.0f, required=%u)", freeSpace, max_prompt_size);
+        resync.markFsMutated();  // stale tmp may already have been removed above
         request->send(413, "text/plain", "Insufficient filesystem space");
         return;
       }
@@ -2342,6 +2784,7 @@ void handleUploadWeb(AsyncWebServerRequest *request, String filename, size_t ind
       if (!request->_tempFile) {
         AI_LOG("[AI] Upload failed: FS error (cannot open temp file)");
         AI_DLOG("[AI] Upload: open() failed for %s", tmp_path);
+        resync.markFsMutated();  // stale tmp may already have been removed above
         request->send(500, "text/plain", "Filesystem error");
         return;
       }
@@ -2362,6 +2805,7 @@ void handleUploadWeb(AsyncWebServerRequest *request, String filename, size_t ind
           AI_LOG("[AI] Upload rejected: prompt too large (estimated=%u + chunk=%u > max=%u)", estimated_size, len, max_prompt_size);
           request->_tempFile.close();
           LittleFS.remove(tmp_path);  // Remove temp file only / Удалить только временный файл
+          resync.markFsMutated();
           request->send(413, "text/plain", "File too large");
           return;
         }
@@ -2375,6 +2819,7 @@ void handleUploadWeb(AsyncWebServerRequest *request, String filename, size_t ind
           AI_LOG("[AI] Upload failed: write error (requested=%u written=%u)", len, bytes_written);
           request->_tempFile.close();
           LittleFS.remove(tmp_path);
+          resync.markFsMutated();
           request->send(500, "text/plain", "Filesystem write error");
           return;
         }
@@ -2384,6 +2829,11 @@ void handleUploadWeb(AsyncWebServerRequest *request, String filename, size_t ind
     }
     
     if (final) {
+      // Transaction ends here on every branch below — success, validation reject, commit failure
+      // and rollback all reach flash.
+      // Транзакция завершается здесь на любой ветке ниже — успех, отказ валидации, сбой коммита
+      // и откат одинаково доходят до flash.
+      resync.markFsMutated();
       if (request->_tempFile) {
         request->_tempFile.flush();  // Final flush before checking size / Финальный flush перед проверкой размера
         size_t new_size = request->_tempFile.size();
@@ -2564,7 +3014,11 @@ void handleUploadWeb(AsyncWebServerRequest *request, String filename, size_t ind
         // IMPORTANT: Reset only after file is written and validated / ВАЖНО: Сброс только после записи и валидации файла
         extern void aiPromptResetCache();
         aiPromptResetCache();
-        
+
+        // Resync is owned by the transaction guard armed above, so success and failure share one
+        // mechanism and neither can emit two.
+        // Ресинхрон принадлежит guard-у, взведённому выше: успех и ошибка идут одним механизмом,
+        // и ни один не может выдать два.
         request->send(200, "text/plain", "OK");
       } else {
         AI_LOG("[AI] Upload failed: FS error (file not open)");
@@ -2721,8 +3175,7 @@ void handleHTTPArgs(AsyncWebServerRequest * request) {
       int v = atoi(p->value().c_str());
       if (v < 0) v = 0;
       if (v > 254) v = 254;
-      config.setVolume((uint8_t)v);
-      player.setVol((uint8_t)v);
+      player.setVol((uint8_t)v);   /* PR_VOL stores the level at the convergence point (0 == MUTE) */
       commandFound=true;
       DBGVB("[%s] vol=%d", __func__, v);
     }
@@ -2749,10 +3202,32 @@ void handleHTTPArgs(AsyncWebServerRequest * request) {
         AsyncWebParameter* safter = request->getParam("after", request->method() == HTTP_POST);
         safterd = atoi(safter->value().c_str());
       }
-      if(sford > 0 && safterd >= 0){
-        request->send(200);
-        config.sleepForAfter(sford, safterd);
-        commandFound=true;
+      if(sford > 0 && sford <= kTimerMaxMinutes &&
+         safterd >= 0 && safterd <= kTimerMaxMinutes){
+        // Preserve NetServer sleep/after semantics through the unified managed timer core.
+        // Сохраняем внешнюю семантику sleep/after через единый managed timer core.
+        const DeepSleepWakeRequest wake =
+            DeepSleepWakeRequest::explicitMinutes(static_cast<uint16_t>(sford));
+        const TimerCommandResult result =
+            safterd == 0
+                ? timer_request_deep_sleep_now(wake)
+                : timer_schedule_deep_sleep(static_cast<uint16_t>(safterd), wake);
+        if (result == TimerCommandResult::Applied) {
+          commandFound=true;
+        } else if (result == TimerCommandResult::ConflictRadioActive) {
+          request->send(409, "text/plain", "radio timer active; cancel it first");
+          return;
+        } else if (result == TimerCommandResult::ConflictDeepSleepActive ||
+                   result == TimerCommandResult::ShutdownInProgress) {
+          request->send(409, "text/plain", "deep sleep timer already active");
+          return;
+        } else {
+          request->send(400, "text/plain", "invalid sleep timer");
+          return;
+        }
+      } else {
+        request->send(400, "text/plain", "invalid sleep timer");
+        return;
       }
     }
     if (request->hasArg("clearspiffs") || request->hasArg("clearfs")) {

@@ -34,16 +34,20 @@
 #include <cstdio>
 #include <cstring>
 #include "../fonts/lv_fonts.h"
+#include "../font_provider.h"
 #include "../profiles/lv_profile_select.h"
 #include "../theme/lv_theme_yoradio.h"
+#include "../main_bg_jpeg.h"
 #include "../control_glyph_utf8.h"
 #include "lvgl_ui.h"
 #include "../lv_page_chain.h"
+#include "../lv_text_scroll.h"
 #include "../../core/config.h"
 #include "../../core/display.h"
 #include "../../core/network.h"
 #include "../../core/player.h"
 #include "../../core/art_key.h"  // Station Art MVP: artNormalizeKey()
+#include "../lv_img_disk_header.h"
 #include <LittleFS.h>
 
 namespace lvgl_ui {
@@ -63,11 +67,10 @@ constexpr lv_opa_t k_ctrl_pressed_opa_utility = static_cast<lv_opa_t>(36); // ~1
 constexpr lv_opa_t k_ctrl_pressed_opa_transport_light = LV_OPA_60;
 constexpr lv_opa_t k_ctrl_pressed_opa_utility_light = LV_OPA_50;
 
-// Stage 6.6R-GB1: control band fill/border opacity is theme-dependent. Light Cloud Ivory shelf at OPA_50
-// over a Cloudscape bg nearly vanishes → matte ivory needs higher fill; Dark slate keeps original feel.
-// Этап 6.6R-GB1: прозрачность полки зависит от темы. Light ivory при OPA_50 почти исчезает — поднимаем; Dark без изменений.
+// Stage 6.6R-GB1 + Slice 1 A/B: named LVGL opa steps (0–255). Same constant in create() and liveReapplyTheme().
+// Light test: LV_OPA_50 (was 90, then 70). Dark/Custom stay LV_OPA_50. / Тест Light: 50; Dark/Custom без изменений.
 constexpr lv_opa_t k_cb_bg_opa_dark      = LV_OPA_50;
-constexpr lv_opa_t k_cb_bg_opa_light     = LV_OPA_90; // matte ivory shelf, still slightly soft / матовая ивори-полка
+constexpr lv_opa_t k_cb_bg_opa_light     = LV_OPA_50;
 constexpr lv_opa_t k_cb_border_opa_dark  = LV_OPA_30;
 constexpr lv_opa_t k_cb_border_opa_light = LV_OPA_70; // warm beige edge reads on ivory / тёплая беж-кромка читается
 
@@ -236,6 +239,10 @@ static void main_set_text_if_changed(lv_obj_t* lbl, const char* s) {
     const char* cur = lv_label_get_text(lbl);
     if (cur != nullptr && strcmp(cur, s) == 0) return;
     lv_label_set_text(lbl, s);
+    // FU6-A: true px/s depends on the CURRENT text width, so the duration must be recomputed
+    // whenever the text really changes. No-op for labels that are not FU6 scrollers.
+    // FU6-A: длительность зависит от текущей ширины текста — пересчитываем при смене текста.
+    text_scroll::notifyTextChanged(lbl);
 }
 
 static void main_set_font(lv_obj_t* obj, const void* font_slot) {
@@ -303,8 +310,33 @@ static void main_reapply_control_icon_btn(lv_obj_t* btn, lv_color_t fg, lv_color
         lv_obj_set_style_text_color(lbl, fg, LV_PART_MAIN);
     }
     lv_obj_set_style_bg_color(btn, pressed_bg, static_cast<lv_style_selector_t>(LV_PART_MAIN) | LV_STATE_PRESSED);
-    // 6.6R-GB1: pressed opa is theme-aware → reapply on switch so Light feedback stays visible.
+    // Theme reinit restores default CARD fill; recreate path used TRANSPARENT idle + pressed opa.
+    // После yoradio_theme_reinit тема снова даёт непрозрачный CARD — как в create(): idle TRANSP.
+    lv_obj_set_style_bg_opa(btn, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(btn, pressed_opa, static_cast<lv_style_selector_t>(LV_PART_MAIN) | LV_STATE_PRESSED);
+}
+
+// Invisible hit-layer (volume strip / gesture guards): kill CARD pad + AUTO scrollbar, keep geometry.
+// LVGL 9 stores width/height/pos as styles — lv_obj_remove_style_all() zeros the hit area, so
+// volume PRESSED never fires and the gesture bubbles to the carousel on _screen.
+// Невидимый hit-layer: убрать CARD-pad и scrollbar, геометрию не трогать. В LVGL 9 w/h/pos —
+// стили; remove_style_all обнуляет зону → громкость не ловит тач, свайп уходит в карусель.
+static void main_sanitize_hit_layer(lv_obj_t* obj) {
+    if (!obj) return;
+    lv_obj_set_style_bg_opa(obj, LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_border_width(obj, 0, LV_PART_MAIN);
+    lv_obj_set_style_outline_width(obj, 0, LV_PART_MAIN);
+    lv_obj_set_style_shadow_width(obj, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(obj, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_left(obj, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_right(obj, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_top(obj, 0, LV_PART_MAIN);
+    lv_obj_set_style_pad_bottom(obj, 0, LV_PART_MAIN);
+    lv_obj_set_style_radius(obj, 0, LV_PART_MAIN);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(obj, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_flag(obj, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(obj, LV_OBJ_FLAG_GESTURE_BUBBLE);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -384,125 +416,129 @@ static void vol_popup_update_position(lv_obj_t* popup, lv_obj_t* bar, int32_t vo
 // Background helpers / Вспомогательные функции фона
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Load a .bin (4-byte lv_img_header_t + RGB565 pixels) from LittleFS into PSRAM.
-// On success: out_buf is ps_malloc'd buffer, out_dsc is ready for lv_img_set_src().
-// Caller owns out_buf and must free() it.
-// Загрузить .bin из LittleFS в PSRAM; out_buf — ps_malloc, освобождать через free().
-static bool bg_load_into_psram(const char* fs_path, uint8_t*& out_buf, lv_img_dsc_t& out_dsc) {
+// Main JPEG RGB565 cache lives in main_bg_jpeg.cpp (module-owned PSRAM).
+// Кэш JPEG RGB565 фона Main — в main_bg_jpeg.cpp (PSRAM принадлежит модулю).
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Station Art loader / Загрузчик арта станции
+// ─────────────────────────────────────────────────────────────────────────────
+
+// STATION-ART-LVGL9-REPAIR: load /logo/<key>.bin into PSRAM as an LVGL 9 descriptor.
+//
+// Handing "L:/logo/<key>.bin" straight to lv_image_set_src() CANNOT work under LVGL 9.5: its bin
+// decoder reads sizeof(lv_image_header_t) == 12 bytes and takes byte 0 as `magic`. Our on-disk
+// header is the YoRadio 4-byte v8 packed word, so byte 0 is the v8 cf (5). magic != 0x19 trips the
+// decoder's legacy fallback, which assigns cf = magic = 5 — an unallocated value in LVGL 9's
+// lv_color_format_t (0x03…0x05 are gaps) — while w/h/stride get read out of the first pixel bytes.
+// cf=5 is not UNKNOWN, so info_cb still returns OK and the widget accepts a nonsense header; the
+// draw-time get_area_cb then rejects cf=5 as unsupported and no pixel is ever produced.
+//
+// So we translate the header ourselves (exactly like the background path) and, for v8
+// TRUE_COLOR_ALPHA, de-interleave the 3 B/pixel payload into LVGL 9's planar RGB565A8 layout.
+// On success out_buf is a ps_malloc'd buffer the caller owns and must free().
+//
+// Передача пути "L:/..." в LVGL 9.5 невозможна: его bin-декодер читает 12-байтный заголовок и
+// принимает байт 0 за magic, поэтому v8-cf (5) попадает в magic, а w/h берутся из пиксельных байт.
+// Поэтому заголовок переводим сами и разбираем чередующиеся пиксели в планарный RGB565A8.
+static bool art_load_into_psram(const char* fs_path, uint8_t*& out_buf, lv_img_dsc_t& out_dsc) {
     out_buf = nullptr;
     File f = LittleFS.open(fs_path, "r");
     if (!f) return false;
 
     const size_t file_sz = static_cast<size_t>(f.size());
-    if (file_sz <= sizeof(lv_img_header_t)) {
+    if (file_sz <= 4) {
+        f.close();
+        Serial.printf("[ART] file too small (%u B): %s\n", (unsigned)file_sz, fs_path);
+        return false;
+    }
+
+    uint8_t hdr_raw[4];
+    if (f.read(hdr_raw, sizeof(hdr_raw)) != sizeof(hdr_raw)) {
         f.close();
         return false;
     }
 
-    lv_img_header_t hdr;
-    if (f.read(reinterpret_cast<uint8_t*>(&hdr), sizeof(hdr)) != sizeof(hdr)) {
+    ImgDiskHeader disk_hdr;
+    imgDiskHeaderParse(hdr_raw, disk_hdr);
+    lv_image_header_t lv_hdr;
+    if (!imgDiskHeaderToLvHeader(disk_hdr, lv_hdr)) {
         f.close();
+        Serial.printf("[ART] unsupported on-disk cf=%u for %s\n", (unsigned)disk_hdr.cf, fs_path);
         return false;
     }
 
-    const uint32_t data_size = static_cast<uint32_t>(file_sz - sizeof(hdr));
-    uint8_t* buf = static_cast<uint8_t*>(ps_malloc(data_size));
+    // v8 cf=5 → 3 B/pixel interleaved on disk; v8 cf=4 → 2 B/pixel RGB565 (no alpha plane).
+    // v8 cf=5 — 3 Б/пиксель с чередованием; cf=4 — 2 Б/пиксель без альфы.
+    const bool     has_alpha     = (lv_hdr.cf == LV_COLOR_FORMAT_RGB565A8);
+    const size_t   bytes_per_px  = has_alpha ? 3u : 2u;
+    const size_t   px            = static_cast<size_t>(disk_hdr.w) * static_cast<size_t>(disk_hdr.h);
+    const size_t   payload       = file_sz - sizeof(hdr_raw);
+
+    if (px == 0 || payload != px * bytes_per_px) {
+        f.close();
+        Serial.printf("[ART] payload mismatch: %u B for %ux%u cf=%u (expected %u) %s\n",
+                      (unsigned)payload, (unsigned)disk_hdr.w, (unsigned)disk_hdr.h,
+                      (unsigned)disk_hdr.cf, (unsigned)(px * bytes_per_px), fs_path);
+        return false;
+    }
+
+    uint8_t* buf = static_cast<uint8_t*>(ps_malloc(payload));
     if (!buf) {
         f.close();
-        Serial.printf("[BG] ps_malloc failed (%u bytes) for %s\n", data_size, fs_path);
+        Serial.printf("[ART] ps_malloc failed (%u bytes) for %s\n", (unsigned)payload, fs_path);
         return false;
     }
 
-    const int32_t n = f.read(buf, data_size);
+    bool ok = true;
+    if (has_alpha) {
+        // Row-wise interleaved → planar so no second full-size buffer is needed.
+        // The color plane is h rows of w*2 bytes; the A8 plane follows at px*2 as h rows of w bytes.
+        // Построчно: цветовая плоскость h×(w*2), затем A8-плоскость h×w — второй большой буфер не нужен.
+        const size_t row_len = static_cast<size_t>(disk_hdr.w) * 3u;
+        uint8_t* row = static_cast<uint8_t*>(ps_malloc(row_len));
+        if (!row) {
+            free(buf);
+            f.close();
+            Serial.printf("[ART] row scratch alloc failed (%u bytes)\n", (unsigned)row_len);
+            return false;
+        }
+        uint8_t* color = buf;
+        uint8_t* alpha = buf + px * 2u;
+        for (uint16_t y = 0; y < disk_hdr.h; y++) {
+            const int n = f.read(row, row_len);
+            if (n < 0 || static_cast<size_t>(n) != row_len) {
+                ok = false;
+                Serial.printf("[ART] read incomplete at row %u: got %d / %u\n",
+                              (unsigned)y, n, (unsigned)row_len);
+                break;
+            }
+            imgDiskRgb565AlphaRowToPlanar(row, disk_hdr.w, color, alpha);
+            color += static_cast<size_t>(disk_hdr.w) * 2u;
+            alpha += disk_hdr.w;
+        }
+        free(row);
+    } else {
+        const int n = f.read(buf, payload);
+        if (n < 0 || static_cast<size_t>(n) != payload) {
+            ok = false;
+            Serial.printf("[ART] read incomplete: got %d / %u bytes\n", n, (unsigned)payload);
+        }
+    }
     f.close();
 
-    if (n < 0 || static_cast<uint32_t>(n) != data_size) {
+    if (!ok) {
         free(buf);
-        Serial.printf("[BG] read incomplete: got %d / %u bytes\n", n, data_size);
         return false;
     }
 
     out_buf           = buf;
-    out_dsc.header    = hdr;
-    out_dsc.data_size = data_size;
+    out_dsc.header    = lv_hdr;
+    out_dsc.data_size = static_cast<uint32_t>(payload);
     out_dsc.data      = buf;
 
-    Serial.printf("[BG] preloaded %s -> PSRAM %u bytes\n", fs_path, data_size);
-    return true;
-}
-
-// ── Main background PSRAM cache (W2G-A) ──────────────────────────────────────────────────────────
-//
-// Survives Main LVGL object lifecycle (W2F auto-delete). The 480×480 RGB565 background buffer
-// (~460 KB) is loaded from LittleFS once and stays in PSRAM until the theme slot changes, the
-// user re-uploads a background via WebUI, or memory pressure requires clearing.
-//
-// Ownership contract:
-//   - s_bg_cache owns the ps_malloc'd buffer; Main page only borrows the pointer.
-//   - Main destroy/releaseAfterAutoDelete MUST NOT free _bg_psram_buf (it belongs to the cache).
-//   - The cache is freed by main_bg_cache_invalidate() or on a path change (theme slot switch).
-//
-// Контракт владения:
-//   - s_bg_cache владеет буфером ps_malloc; страница Main только заимствует указатель.
-//   - destroy/releaseAfterAutoDelete НЕ должны освобождать _bg_psram_buf (владелец — кэш).
-//   - Кэш освобождается через main_bg_cache_invalidate() или при смене слота темы.
-
-struct MainBgCache {
-    char         path[64] = {};      // LittleFS path of cached background / путь к закэшированному фону
-    uint8_t*     data     = nullptr; // ps_malloc'd pixel buffer (owned) / пиксельный буфер ps_malloc (владелец)
-    lv_img_dsc_t dsc      = {};      // descriptor ready for lv_img_set_src() / дескриптор для LVGL
-    bool valid() const { return data != nullptr && path[0] != '\0'; }
-};
-static MainBgCache s_bg_cache;  // zero-initialised at load time / нулевая инициализация при загрузке
-
-// Free the cached buffer and reset all fields.
-// Освободить буфер кэша и сбросить все поля.
-static void main_bg_cache_invalidate() {
-    if (s_bg_cache.data) {
-        Serial.printf("[BG_CACHE] clear %s\n", s_bg_cache.path);
-        free(s_bg_cache.data);
-        s_bg_cache.data = nullptr;
-    }
-    s_bg_cache.path[0] = '\0';
-    s_bg_cache.dsc = {};
-}
-
-// Look up or load fs_path. Returns true if data is available (hit or freshly loaded).
-// out_dsc receives a descriptor whose .data points INTO the cache buffer — do NOT free it.
-// Поиск или загрузка. Возвращает true если данные доступны (попадание или свежая загрузка).
-// out_dsc.data указывает в кэш-буфер — не освобождать.
-static bool main_bg_cache_get(const char* fs_path, lv_img_dsc_t& out_dsc) {
-    if (!fs_path || fs_path[0] == '\0') return false;
-
-    // Cache hit — same path, buffer present.
-    // Попадание — тот же путь, буфер есть.
-    if (s_bg_cache.valid() &&
-        strncmp(s_bg_cache.path, fs_path, sizeof(s_bg_cache.path) - 1) == 0) {
-        Serial.printf("[BG_CACHE] hit %s (%u bytes)\n", fs_path,
-                      (unsigned)s_bg_cache.dsc.data_size);
-        out_dsc = s_bg_cache.dsc;
-        return true;
-    }
-
-    // Cache miss or path change — release old buffer and load fresh.
-    // Промах или смена пути — освобождаем старый буфер, загружаем новый.
-    if (s_bg_cache.data) {
-        Serial.printf("[BG_CACHE] reload old=%s new=%s\n", s_bg_cache.path, fs_path);
-    } else {
-        Serial.printf("[BG_CACHE] miss %s\n", fs_path);
-    }
-    main_bg_cache_invalidate();
-
-    uint8_t* buf = nullptr;
-    lv_img_dsc_t dsc = {};
-    if (!bg_load_into_psram(fs_path, buf, dsc)) {
-        return false;
-    }
-
-    s_bg_cache.data = buf;
-    s_bg_cache.dsc  = dsc;
-    strlcpy(s_bg_cache.path, fs_path, sizeof(s_bg_cache.path));
-    out_dsc = dsc;
+    Serial.printf("[ART] preloaded %s -> PSRAM %u B (%ux%u v8cf=%u lvcf=0x%02X)\n",
+                  fs_path, (unsigned)payload, (unsigned)disk_hdr.w, (unsigned)disk_hdr.h,
+                  (unsigned)disk_hdr.cf, (unsigned)lv_hdr.cf);
     return true;
 }
 
@@ -583,7 +619,7 @@ static void vol_touch_cb(lv_event_t* e) {
     lv_event_code_t code = lv_event_get_code(e);
     LvglMainScreen* self = static_cast<LvglMainScreen*>(lv_event_get_user_data(e));
     if (!self) return;
-    lv_obj_t* touch_zone = lv_event_get_target(e);
+    lv_obj_t* touch_zone = lv_event_get_target_obj(e);
     lv_obj_t* bar = static_cast<lv_obj_t*>(lv_obj_get_user_data(touch_zone));
     if (!bar) return;
     lv_obj_t* popup = static_cast<lv_obj_t*>(lv_obj_get_user_data(bar));
@@ -784,10 +820,15 @@ void LvglMainScreen::create_mid_block(LvglMainScreen& self, const YoRadioPalette
                     if (init_key[0] != '\0') {
                         snprintf(init_fs, sizeof(init_fs), "/logo/%s.bin", init_key);
                     }
-                    if (init_key[0] != '\0' && LittleFS.exists(init_fs)) {
-                        char init_lvgl[88] = {};
-                        snprintf(init_lvgl, sizeof(init_lvgl), "L:/logo/%s.bin", init_key);
-                        lv_img_set_src(self._art_img, init_lvgl);
+                    // STATION-ART-LVGL9-REPAIR: preload into PSRAM (never a "L:/..." path — LVGL
+                    // 9.5's bin decoder cannot read the v8 on-disk header, see art_load_into_psram).
+                    // A present-but-undecodable file leaves the slot HIDDEN (Mode A) rather than
+                    // revealing an empty frame; _art_last_station_num stays 0xFFFF so the first
+                    // update() re-evaluates via _reloadArtIfNeeded().
+                    // Предзагрузка в PSRAM вместо пути "L:/...": LVGL 9.5 не читает v8-заголовок.
+                    // Файл есть, но не декодируется → остаёмся в Mode A (пустую рамку не показываем).
+                    if (init_key[0] != '\0' && LittleFS.exists(init_fs) &&
+                        self._setArtImageSource(init_fs)) {
                         lv_obj_clear_flag(self._art_slot, LV_OBJ_FLAG_HIDDEN); // Mode B
                         strlcpy(self._art_current_key, init_key, sizeof(self._art_current_key));
                         self._art_last_station_num = config.lastStation();
@@ -836,22 +877,20 @@ void LvglMainScreen::create_mid_block(LvglMainScreen& self, const YoRadioPalette
                 self._lbl_station_name = lv_label_create(cont_text);
                 if (self._lbl_station_name) {
                     lv_label_set_text(self._lbl_station_name, "---");
-                    lv_label_set_long_mode(self._lbl_station_name, LV_LABEL_LONG_SCROLL_CIRCULAR);
                     lv_obj_set_width(self._lbl_station_name, LV_PCT(100));
                     // Main font experiment: 32 px anchor (direct font ref, not profile slot).
                     // Эксперимент: якорь 32 px.
-                    main_set_font(self._lbl_station_name, reinterpret_cast<const void*>(&lv_font_yora_montserrat_32_cyr));
+                    main_set_font(self._lbl_station_name, FontProvider::text(32));
                     lv_obj_set_style_text_color(self._lbl_station_name, pal.station_name_text, LV_PART_MAIN);
                 }
 
                 self._lbl_track = lv_label_create(cont_text);
                 if (self._lbl_track) {
                     lv_label_set_text(self._lbl_track, " ");
-                    lv_label_set_long_mode(self._lbl_track, LV_LABEL_LONG_SCROLL_CIRCULAR);
                     lv_obj_set_width(self._lbl_track, LV_PCT(100));
                     // Second tier: 22 px.
                     // Второй уровень: 22 px.
-                    main_set_font(self._lbl_track, reinterpret_cast<const void*>(&lv_font_yora_montserrat_22_cyr));
+                    main_set_font(self._lbl_track, FontProvider::text(22));
                     lv_obj_set_style_text_color(self._lbl_track, pal.track_text, LV_PART_MAIN);
                     lv_obj_set_style_pad_top(self._lbl_track, k_main_track_pad_top, LV_PART_MAIN);
                     lv_obj_add_flag(self._lbl_track, LV_OBJ_FLAG_HIDDEN);
@@ -860,11 +899,10 @@ void LvglMainScreen::create_mid_block(LvglMainScreen& self, const YoRadioPalette
                 self._lbl_artist = lv_label_create(cont_text);
                 if (self._lbl_artist) {
                     lv_label_set_text(self._lbl_artist, " ");
-                    lv_label_set_long_mode(self._lbl_artist, LV_LABEL_LONG_SCROLL_CIRCULAR);
                     lv_obj_set_width(self._lbl_artist, LV_PCT(100));
                     // Third tier: 18 px (experiment ladder).
                     // Третий уровень: 18 px.
-                    main_set_font(self._lbl_artist, reinterpret_cast<const void*>(&lv_font_yora_montserrat_18_cyr));
+                    main_set_font(self._lbl_artist, FontProvider::text(18));
                     lv_obj_set_style_text_color(self._lbl_artist, pal.artist_text, LV_PART_MAIN);
                     lv_obj_add_flag(self._lbl_artist, LV_OBJ_FLAG_HIDDEN);
                 }
@@ -900,6 +938,14 @@ void LvglMainScreen::create_mid_block(LvglMainScreen& self, const YoRadioPalette
                         lv_obj_set_style_text_align(self._lbl_artist, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
                     }
                 }
+
+                // FU6-A: register AFTER width/font/alignment are final — the shared helper reads
+                // the text width and the screen's own text_align at registration time.
+                // FU6-A: регистрируем ПОСЛЕ ширины/шрифта/выравнивания — хелпер читает ширину
+                // текста и исходное выравнивание экрана в момент регистрации.
+                text_scroll::registerLabel(self._lbl_station_name);
+                text_scroll::registerLabel(self._lbl_track);
+                text_scroll::registerLabel(self._lbl_artist);
             }
         }
     }
@@ -982,8 +1028,7 @@ void LvglMainScreen::create_bottom_zone(LvglMainScreen& self, const YoRadioPalet
 
         // 6.1E: list/settings = transport font + pad/min (size); color/pressed stay utility (secondary + calmer opa).
         // Размер list/settings как у транспорта; цвет и pressed — как раньше у utility.
-        const lv_font_t* f_ctrl_transport =
-            (W <= 320u) ? &lv_font_yora_control_icons_26 : &lv_font_yora_control_icons_28;
+        const lv_font_t* f_ctrl_transport = FontProvider::icon((W <= 320u) ? 26 : 28);
         const lv_coord_t pad_tr = (W <= 320u) ? static_cast<lv_coord_t>(12) : static_cast<lv_coord_t>(16);
         const lv_coord_t min_tr = (W <= 320u) ? static_cast<lv_coord_t>(54) : static_cast<lv_coord_t>(58);
 
@@ -1065,7 +1110,8 @@ void LvglMainScreen::create_bottom_zone(LvglMainScreen& self, const YoRadioPalet
                     lv_grad_dsc_t* const gd = &s_cb_rim_glow_grad[gi];
                     std::memset(gd, 0, sizeof(*gd));
                     gd->dir = LV_GRAD_DIR_HOR;
-                    gd->dither = LV_DITHER_NONE;
+                    // BASE-LVGL9-MIGRATION C7: lv_grad_dsc_t.dither / LV_DITHER_NONE removed in v9
+                    // (no per-gradient dither toggle; memset above already zero-inits the struct).
                     gd->stops_count = 4;
                     gd->stops[0].frac = 0;
                     gd->stops[1].frac = 108; // peak left of centre — long gentle falloff to the right / длинный спад вправо
@@ -1287,7 +1333,7 @@ void LvglMainScreen::create_bottom_zone(LvglMainScreen& self, const YoRadioPalet
                 lv_obj_set_width(self._lbl_stream_info, LV_PCT(100));
                 lv_label_set_long_mode(self._lbl_stream_info, LV_LABEL_LONG_CLIP);
                 lv_obj_set_style_text_align(self._lbl_stream_info, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-                main_set_font(self._lbl_stream_info, reinterpret_cast<const void*>(&lv_font_yora_montserrat_16_cyr));
+                main_set_font(self._lbl_stream_info, FontProvider::text(16));
                 lv_obj_set_style_text_color(self._lbl_stream_info, pal.text_meta, LV_PART_MAIN);
                 {
                     char ib[64];
@@ -1316,14 +1362,14 @@ void LvglMainScreen::create_bottom_zone(LvglMainScreen& self, const YoRadioPalet
             self._lbl_volume = lv_label_create(col_vol);
             if (self._lbl_volume) {
                 lv_label_set_text(self._lbl_volume, "Vol: --");
-                main_set_font(self._lbl_volume, LV_ACTIVE_PROFILE.font_small);
+                main_set_font(self._lbl_volume, FontProvider::text(LV_ACTIVE_PROFILE.font_small_px));
                 lv_obj_set_style_text_color(self._lbl_volume, pal.text_secondary, LV_PART_MAIN);
             }
 
             self._bar_volume = lv_bar_create(col_vol);
             if (self._bar_volume) {
                 lv_bar_set_range(self._bar_volume, 0, 254);
-                lv_bar_set_value(self._bar_volume, static_cast<int32_t>(config.store.volume), LV_ANIM_OFF);
+                lv_bar_set_value(self._bar_volume, static_cast<int32_t>(player.audibleVolume()), LV_ANIM_OFF);
                 lv_obj_set_width(self._bar_volume, LV_PCT(100));
                 // H=16: compromise between slim 10px bar and test H=20 — gradient+shadow still readable.
                 // H=16, radius=8 (capsule), pad 3 top/bottom → fill H=10, fill radius=5; pad 3 left/right.
@@ -1377,7 +1423,7 @@ void LvglMainScreen::create_bottom_zone(LvglMainScreen& self, const YoRadioPalet
             self._lbl_vol_popup = lv_label_create(self._screen);
             if (self._lbl_vol_popup && self._bar_volume) {
                 lv_label_set_text(self._lbl_vol_popup, "");
-                main_set_font(self._lbl_vol_popup, LV_ACTIVE_PROFILE.font_small);
+                main_set_font(self._lbl_vol_popup, FontProvider::text(LV_ACTIVE_PROFILE.font_small_px));
                 lv_obj_set_style_text_color(self._lbl_vol_popup, pal.text_primary, LV_PART_MAIN);
                 lv_obj_set_style_bg_color(self._lbl_vol_popup, pal.panel_background, LV_PART_MAIN);
                 lv_obj_set_style_bg_opa(self._lbl_vol_popup, LV_OPA_80, LV_PART_MAIN);
@@ -1406,17 +1452,19 @@ void LvglMainScreen::create_bottom_zone(LvglMainScreen& self, const YoRadioPalet
             lv_obj_set_style_bg_opa(self._bar_buffer, LV_OPA_COVER, LV_PART_MAIN);
             lv_obj_set_style_bg_color(self._bar_buffer, pal.buffer_meter_fill, LV_PART_INDICATOR);
             lv_obj_set_style_bg_opa(self._bar_buffer, LV_OPA_COVER, LV_PART_INDICATOR);
+            lv_obj_set_style_pad_all(self._bar_buffer, 0, LV_PART_MAIN);
             lv_obj_clear_flag(self._bar_buffer, LV_OBJ_FLAG_CLICKABLE);
+            lv_obj_clear_flag(self._bar_buffer, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_scrollbar_mode(self._bar_buffer, LV_SCROLLBAR_MODE_OFF);
         }
 
         self._lbl_ai_line = lv_label_create(zone_bottom);
         if (self._lbl_ai_line) {
             lv_label_set_text(self._lbl_ai_line, "");
-            lv_label_set_long_mode(self._lbl_ai_line, LV_LABEL_LONG_SCROLL_CIRCULAR);
             lv_obj_set_width(self._lbl_ai_line, LV_PCT(100));
             lv_obj_set_style_text_align(self._lbl_ai_line, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
             // AI line: 16 px (was 14) — one tier up for readability / строка AI: 16 px, чуть крупнее
-            const lv_font_t* const f_ai = reinterpret_cast<const lv_font_t*>(&lv_font_yora_montserrat_16_cyr);
+            const lv_font_t* const f_ai = FontProvider::text(16);
             main_set_font(self._lbl_ai_line, reinterpret_cast<const void*>(f_ai));
             lv_obj_set_style_text_color(self._lbl_ai_line, pal.bottom_ai_text, LV_PART_MAIN);
             // One line from font metrics — slot stability only; lower divider position is NOT from this (symmetry pass).
@@ -1425,6 +1473,11 @@ void LvglMainScreen::create_bottom_zone(LvglMainScreen& self, const YoRadioPalet
             // Swipe must not bubble to _screen — carousel listens on page root (5.3).
             // Свайп по строке AI не должен всплывать на экран с обработчиком карусели.
             lv_obj_clear_flag(self._lbl_ai_line, LV_OBJ_FLAG_GESTURE_BUBBLE);
+            lv_obj_clear_flag(self._lbl_ai_line, LV_OBJ_FLAG_SCROLLABLE);
+            lv_obj_set_scrollbar_mode(self._lbl_ai_line, LV_SCROLLBAR_MODE_OFF);
+            // FU6-A: register last — width, font and CENTER alignment are all final here.
+            // FU6-A: регистрируем последним — ширина, шрифт и выравнивание уже заданы.
+            text_scroll::registerLabel(self._lbl_ai_line);
         }
 
         // Vertical divider contract: screen.y2 - heapbar.y2 == status_divider.y1 - screen.y1 (real coords after layout).
@@ -1476,8 +1529,7 @@ void LvglMainScreen::create_bottom_zone(LvglMainScreen& self, const YoRadioPalet
                     lv_obj_set_width(self._vol_touch_zone, LV_PCT(100));
                     lv_obj_set_height(self._vol_touch_zone, strip_h);
                     lv_obj_set_pos(self._vol_touch_zone, 0, top_rel);
-                    lv_obj_set_style_bg_opa(self._vol_touch_zone, LV_OPA_TRANSP, LV_PART_MAIN);
-                    lv_obj_set_style_border_width(self._vol_touch_zone, 0, LV_PART_MAIN);
+                    main_sanitize_hit_layer(self._vol_touch_zone);
                     lv_obj_add_flag(self._vol_touch_zone, LV_OBJ_FLAG_CLICKABLE);
                     lv_obj_clear_flag(self._vol_touch_zone, LV_OBJ_FLAG_GESTURE_BUBBLE);
                     lv_obj_set_user_data(self._vol_touch_zone, self._bar_volume);
@@ -1506,8 +1558,7 @@ void LvglMainScreen::create_bottom_zone(LvglMainScreen& self, const YoRadioPalet
                         lv_obj_set_width(self._vol_gesture_guard, LV_PCT(100));
                         lv_obj_set_height(self._vol_gesture_guard, guard_h);
                         lv_obj_set_pos(self._vol_gesture_guard, 0, guard_y_rel);
-                        lv_obj_set_style_bg_opa(self._vol_gesture_guard, LV_OPA_TRANSP, LV_PART_MAIN);
-                        lv_obj_set_style_border_width(self._vol_gesture_guard, 0, LV_PART_MAIN);
+                        main_sanitize_hit_layer(self._vol_gesture_guard);
                         lv_obj_add_flag(self._vol_gesture_guard, LV_OBJ_FLAG_CLICKABLE);
                         lv_obj_clear_flag(self._vol_gesture_guard, LV_OBJ_FLAG_GESTURE_BUBBLE);
                         // Ensure guard is above flex children (e.g. AI label) for hit-testing.
@@ -1534,8 +1585,7 @@ void LvglMainScreen::create_bottom_zone(LvglMainScreen& self, const YoRadioPalet
                     lv_obj_set_width(self._screen_bottom_carousel_guard, LV_PCT(100));
                     lv_obj_align_to(self._screen_bottom_carousel_guard, zone_bottom, LV_ALIGN_OUT_BOTTOM_MID, 0, 0);
                     lv_obj_set_height(self._screen_bottom_carousel_guard, gap_px);
-                    lv_obj_set_style_bg_opa(self._screen_bottom_carousel_guard, LV_OPA_TRANSP, LV_PART_MAIN);
-                    lv_obj_set_style_border_width(self._screen_bottom_carousel_guard, 0, LV_PART_MAIN);
+                    main_sanitize_hit_layer(self._screen_bottom_carousel_guard);
                     lv_obj_add_flag(self._screen_bottom_carousel_guard, LV_OBJ_FLAG_CLICKABLE);
                     lv_obj_clear_flag(self._screen_bottom_carousel_guard, LV_OBJ_FLAG_GESTURE_BUBBLE);
                     lv_obj_move_foreground(self._screen_bottom_carousel_guard);
@@ -1557,36 +1607,49 @@ void LvglMainScreen::reloadFileBackgroundFromLittlefs() {
     if (!_bg_img) {
         return;
     }
-    // W2G-A: WebUI uploaded a new background file → must bypass the cache and reload from LittleFS.
-    // W2G-A: WebUI загрузил новый фон → инвалидируем кэш и принудительно перезагружаем из LittleFS.
-    main_bg_cache_invalidate();
+    // WebUI / slot commit replaced the file → drop cache and decode on the worker.
+    // WebUI / смена слота заменила файл → сбросить кэш и декодировать на worker.
+    lv_obj_add_flag(_bg_img, LV_OBJ_FLAG_HIDDEN);
+    mainBgCacheInvalidate();
     _bg_psram_buf = nullptr;
     _bg_psram_dsc = {};
+    uint8_t slot = static_cast<uint8_t>(yoradio_theme_active_preset());
+    if (slot > 2) slot = 0;
+    mainBgCacheRequestAsync(mainBgResolvedJpegPathForSlot(slot));
     _applyBgTheme(true);
     if (_bg_scrim) {
         main_sync_dark_bg_scrim(_bg_img, _bg_scrim);
     }
 }
 
+bool LvglMainScreen::refreshBackgroundFromCache() {
+    if (!_bg_img) return false;
+    _applyBgTheme(true);
+    if (_bg_scrim) {
+        main_sync_dark_bg_scrim(_bg_img, _bg_scrim);
+    }
+    // Repair B: lv_img_set_src / clear HIDDEN may not dirty PARTIAL; next timer_handler must flush.
+    // Do not lv_refr_now / resync here — that is A2/D, not this seam.
+    // Repair B: src/HIDDEN могут не пометить PARTIAL dirty; flush на следующем timer_handler.
+    if (_bg_img) {
+        lv_obj_invalidate(_bg_img);
+    }
+    if (_screen) {
+        lv_obj_invalidate(_screen);
+    }
+    return true;
+}
+
 void LvglMainScreen::_applyBgTheme(bool force) {
     if (!_bg_img) return;
 
-    static const char* const k_fs[] = {
-        "/bg/main_dark.bin",
-        "/bg/main_light.bin",
-        "/bg/main_custom.bin",
-    };
-    static const char* const k_lvgl[] = {
-        "L:/bg/main_dark.bin",
-        "L:/bg/main_light.bin",
-        "L:/bg/main_custom.bin",
-    };
-
     uint8_t slot = static_cast<uint8_t>(yoradio_theme_active_preset());
     if (slot > 2) slot = 0;
+    const char* path = mainBgResolvedJpegPathForSlot(slot);
+    const char* factory = mainBgJpegPathForSlot(slot);
 
-    // E36FS1a: missing .bin — hide only; LVGL 8 warns on lv_img_set_src(nullptr).
-    // E36FS1a: нет файла — только скрыть; nullptr в set_src даёт warn в LVGL 8.
+    // Missing/unreadable JPEG — hide image; screen keeps theme-colored background.
+    // Нет/нечитаемый JPEG — скрыть картинку; экран остаётся цветом темы.
     auto hide_bg_missing_file = [this]() {
         lv_obj_add_flag(_bg_img, LV_OBJ_FLAG_HIDDEN);
         _syncBgImgLayout();
@@ -1594,7 +1657,8 @@ void LvglMainScreen::_applyBgTheme(bool force) {
 
     // Periodic update: slot still missing and already hidden — no lv_* churn.
     // Периодический update: файл по-прежнему отсутствует, фон уже скрыт — без лишних lv_*.
-    if (!force && slot == _bg_last_slot && _bg_absent_latched && !LittleFS.exists(k_fs[slot])) {
+    if (!force && slot == _bg_last_slot && _bg_absent_latched &&
+        !LittleFS.exists(path) && !LittleFS.exists(factory)) {
         return;
     }
 
@@ -1602,48 +1666,36 @@ void LvglMainScreen::_applyBgTheme(bool force) {
     // No lv_img_set_src → no LVGL invalidation → no LFS read on next frame.
     // Быстрый путь: буфер этого слота уже заимствован из кэша → только проверка удаления файла.
     if (!force && slot == _bg_last_slot && _bg_psram_buf != nullptr) {
-        if (!LittleFS.exists(k_fs[slot])) {
-            // File deleted from LittleFS: invalidate cache + clear borrowed pointer.
-            // Файл удалён из LittleFS: инвалидировать кэш + сбросить заимствованный указатель.
-            main_bg_cache_invalidate();
+        if (!LittleFS.exists(path) && !LittleFS.exists(factory)) {
+            mainBgCacheInvalidate();
             _bg_psram_buf = nullptr;
             _bg_psram_dsc = {};
             hide_bg_missing_file();
             _bg_absent_latched = true;
         }
-        return; // No lv_img_set_src → no LVGL invalidation → no LFS read on next frame
+        return;
     }
 
-    // Slow path: slot changed, forced reload, or no buffer yet.
-    // W2G-A: do NOT free _bg_psram_buf here — the cache owns the allocation.
-    //        Just clear the borrowed pointer and update the slot tracker.
-    // Медленный путь: смена слота, принудительная загрузка или буфер ещё не создан.
-    // W2G-A: не освобождать _bg_psram_buf — буфер принадлежит кэшу; только очищаем заимствованный указатель.
     _bg_psram_buf = nullptr;
     _bg_psram_dsc = {};
     _bg_last_slot = slot;
 
-    if (!LittleFS.exists(k_fs[slot])) {
+    if (!LittleFS.exists(path) && !LittleFS.exists(factory)) {
         hide_bg_missing_file();
         _bg_absent_latched = true;
         return;
     }
 
-    // W2G-A: ask the cache for the background buffer (hit = PSRAM reuse, miss = LFS load + cache).
-    // _bg_psram_buf borrows the pointer from the cache; must NOT be freed in destroy/release.
-    // W2G-A: запрашиваем буфер у кэша (попадание = reuse PSRAM, промах = LFS-загрузка + кэш).
-    // _bg_psram_buf заимствует указатель у кэша; в destroy/release НЕ освобождать.
     _bg_absent_latched = false;
-    if (main_bg_cache_get(k_fs[slot], _bg_psram_dsc)) {
-        _bg_psram_buf = const_cast<uint8_t*>(_bg_psram_dsc.data); // borrowed / заимствован
+    if (mainBgCacheGet(path, _bg_psram_dsc) || mainBgCacheGet(factory, _bg_psram_dsc)) {
+        _bg_psram_buf = const_cast<uint8_t*>(_bg_psram_dsc.data);
         lv_img_set_src(_bg_img, &_bg_psram_dsc);
+        lv_obj_clear_flag(_bg_img, LV_OBJ_FLAG_HIDDEN);
+        _syncBgImgLayout();
     } else {
-        // Fallback: file-backed path (LFS reads on DspTask — slow, but better than no image).
-        // Резервный путь: читаем из LittleFS напрямую (медленно, но без крэша).
-        lv_img_set_src(_bg_img, k_lvgl[slot]);
+        hide_bg_missing_file();
+        _bg_absent_latched = true;
     }
-    lv_obj_clear_flag(_bg_img, LV_OBJ_FLAG_HIDDEN);
-    _syncBgImgLayout();
 }
 
 void LvglMainScreen::_syncBgImgLayout() {
@@ -1687,8 +1739,8 @@ void LvglMainScreen::create() {
     lv_obj_set_flex_align(_screen, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
     lv_obj_clear_flag(_screen, LV_OBJ_FLAG_SCROLLABLE);
 
-    // 6.1F-b: bottom-most layer — full-screen img; FLOATING so flex ignores it; hidden if no bin on LittleFS.
-    // 6.1F-b: нижний слой — полноэкранный img; FLOATING — вне flex; скрыт если нет .bin в LittleFS.
+    // Full-screen JPEG layer; FLOATING so flex ignores it; hidden if no JPEG in cache/LittleFS.
+    // Полноэкранный JPEG; FLOATING вне flex; скрыт если нет JPEG в кэше/LittleFS.
     _bg_img = lv_img_create(_screen);
     if (_bg_img) {
         lv_obj_add_flag(_bg_img, LV_OBJ_FLAG_FLOATING);
@@ -1730,16 +1782,61 @@ void LvglMainScreen::create() {
 // Station Art MVP: runtime-перезагрузка арта (только DspTask).
 // ---------------------------------------------------------------------------
 
-void LvglMainScreen::_reloadArtIfNeeded() {
+// STATION-ART-LVGL9-REPAIR: never pass "L:/logo/<key>.bin" to lv_img_set_src() — LVGL 9.5's bin
+// decoder cannot read the YoRadio v8 on-disk header (see art_load_into_psram). Preload to PSRAM and
+// point the widget at the descriptor instead.
+// Возвращает false, если ассет отсутствует/не декодируется — вызывающий остаётся в Mode A.
+bool LvglMainScreen::_setArtImageSource(const char* fs_path) {
+    if (!_art_img || !fs_path || fs_path[0] == '\0') return false;
+
+    uint8_t*     buf = nullptr;
+    lv_img_dsc_t dsc = {};
+    if (!art_load_into_psram(fs_path, buf, dsc)) {
+        return false; // keep the current buffer/source untouched / текущий буфер не трогаем
+    }
+
+    // Publish the new buffer BEFORE freeing the old one: lv_img_set_src() always invalidates and the
+    // widget must never hold a pointer into freed PSRAM, not even transiently.
+    // Сначала подменяем источник, только потом освобождаем прежний буфер.
+    uint8_t* old_buf = _art_psram_buf;
+    _art_psram_buf   = buf;
+    _art_psram_dsc   = dsc;
+
+    // Image + header caches are disabled (lv_conf.h: LV_CACHE_DEF_SIZE 0,
+    // LV_IMAGE_HEADER_CACHE_DEF_CNT 0), so LVGL keeps no decoded copy between draws — re-pointing at
+    // the descriptor is all a same-key replacement needs; no lv_image_cache_drop() is required.
+    // Кэш изображений и заголовков отключён — повторное наведение на дескриптор достаточно.
+    lv_img_set_src(_art_img, &_art_psram_dsc);
+
+    if (old_buf) free(old_buf);
+
+    // One concise line proving the swap actually happened: a same-station replacement must show a
+    // NEW src address here. Exactly one buffer is released per successful swap, so alternating
+    // addresses across repeated replacements are the expected steady state (no growth).
+    // Одна строка, доказывающая подмену: при замене арта адрес src обязан измениться.
+    Serial.printf("[ART] source swap: %p -> %p (%u B)\n",
+                  (void*)old_buf, (void*)buf, (unsigned)dsc.data_size);
+    return true;
+}
+
+void LvglMainScreen::_releaseArtBuffer() {
+    if (_art_psram_buf) {
+        free(_art_psram_buf);
+        _art_psram_buf = nullptr;
+    }
+    _art_psram_dsc = {};
+}
+
+void LvglMainScreen::_reloadArtIfNeeded(bool force) {
     if (!_art_slot || !_art_img) return;
 
     const uint16_t current_num = config.lastStation();
 
-    // Re-evaluate only when station changes or forced (avoids stationByNum() I/O every update tick).
-    // Пересчитываем только при смене станции или принудительном флаге (минимальный I/O).
-    if (current_num == _art_last_station_num && !_art_reload_forced) return;
+    // Re-evaluate only when the station changes or the caller forces it (avoids stationByNum() I/O
+    // on every update tick).
+    // Пересчитываем только при смене станции или при force (минимальный I/O на каждом тике).
+    if (!force && current_num == _art_last_station_num) return;
     _art_last_station_num = current_num;
-    _art_reload_forced    = false;
 
     // Stable source: playlist name via stationByNum — never config.station.name (may be ICY-overwritten).
     // Стабильный источник: плейлистное имя через stationByNum, не config.station.name.
@@ -1747,31 +1844,45 @@ void LvglMainScreen::_reloadArtIfNeeded() {
 
     char key[68]  = {};
     char fs_path[84]   = {};
-    char lvgl_path[88] = {};
     artNormalizeKey(playlist_name, key, sizeof(key));
     if (key[0] != '\0') {
-        snprintf(fs_path,   sizeof(fs_path),   "/logo/%s.bin",   key);
-        snprintf(lvgl_path, sizeof(lvgl_path), "L:/logo/%s.bin", key);
+        snprintf(fs_path, sizeof(fs_path), "/logo/%s.bin", key);
     }
 
     const bool file_exists      = (key[0] != '\0') && LittleFS.exists(fs_path);
     const bool currently_visible = !lv_obj_has_flag(_art_slot, LV_OBJ_FLAG_HIDDEN);
     const bool key_changed      = (strncmp(_art_current_key, key, sizeof(_art_current_key)) != 0);
 
-    if (!key_changed && (file_exists == currently_visible)) {
+    // STATION-ART-SAME-STATION-REPLACE: this guard compares only *state* (does a file exist, is the
+    // slot visible) — it is blind to the file's CONTENT. On a same-station replacement the key is
+    // unchanged and present==visible, so it used to return here and _setArtImageSource() was never
+    // reached: the screen kept showing the previous art until a reboot re-ran the create() preload.
+    // `force` (ART_FS_UPDATED) must therefore bypass it — the filesystem is authoritative.
+    // Этот guard сравнивает только состояние (есть файл / виден слот) и не видит содержимое файла.
+    // При замене арта той же станции ключ тот же и present==visible — раньше здесь был return, и
+    // _setArtImageSource() не вызывался. force (ART_FS_UPDATED) обязан обходить этот guard.
+    if (!force && !key_changed && (file_exists == currently_visible)) {
         return; // nothing changed — skip all lv_* calls
     }
 
     strlcpy(_art_current_key, key, sizeof(_art_current_key));
 
-    if (file_exists) {
-        lv_img_set_src(_art_img, lvgl_path);
+    // STATION-ART-LVGL9-REPAIR: a present-but-undecodable file must fall back to Mode A, never
+    // reveal an empty frame — so layout below follows art_visible (load result), not file_exists.
+    // Файл есть, но не декодируется → Mode A, а не пустая рамка: ниже используется art_visible.
+    const bool art_visible = file_exists && _setArtImageSource(fs_path);
+
+    if (art_visible) {
         lv_obj_clear_flag(_art_slot, LV_OBJ_FLAG_HIDDEN); // Mode B: art visible
     } else {
-        // Do NOT call lv_img_set_src(nullptr) — LVGL 8.x warns "unknown type" for NULL src.
-        // Hiding the slot is sufficient: LVGL skips rendering hidden objects entirely.
-        // lv_img_set_src(nullptr) не вызываем — LVGL 8 даёт warn "unknown type" для NULL.
-        // Скрытие слота достаточно: LVGL не рендерит скрытые объекты.
+        if (file_exists) {
+            Serial.printf("[ART] decode failed, staying in Mode A: %s\n", fs_path);
+        }
+        // LVGL 9: lv_img_set_src(nullptr) resets the image attributes silently (it only warns for a
+        // non-NULL unknown src), so detaching first is safe — and required before the buffer is freed.
+        // LVGL 9: NULL-src сбрасывает атрибуты без warn; отвязываемся до освобождения буфера.
+        lv_img_set_src(_art_img, nullptr);
+        _releaseArtBuffer();
         lv_obj_add_flag(_art_slot, LV_OBJ_FLAG_HIDDEN);   // Mode A: no art, cont_text expands
     }
 
@@ -1779,8 +1890,8 @@ void LvglMainScreen::_reloadArtIfNeeded() {
     // CENTER when no art; START/LEFT when art is visible.
     // Синхронизируем выравнивание flex/text с Mode A/B (зеркало has_cover из create()).
     {
-        const lv_flex_align_t fa = file_exists ? LV_FLEX_ALIGN_START  : LV_FLEX_ALIGN_CENTER;
-        const lv_text_align_t ta = file_exists ? LV_TEXT_ALIGN_LEFT   : LV_TEXT_ALIGN_CENTER;
+        const lv_flex_align_t fa = art_visible ? LV_FLEX_ALIGN_START  : LV_FLEX_ALIGN_CENTER;
+        const lv_text_align_t ta = art_visible ? LV_TEXT_ALIGN_LEFT   : LV_TEXT_ALIGN_CENTER;
         if (_cont_mid) {
             lv_obj_set_flex_align(_cont_mid,  fa, fa, fa);
         }
@@ -1801,7 +1912,7 @@ void LvglMainScreen::_reloadArtIfNeeded() {
     // Update flex grow for art/no-art vertical composition (spacers around cont_mid).
     // Обновляем grow спейсеров для вертикальной компоновки с артом и без.
     if (_spacer_top && _spacer_bottom) {
-        if (file_exists) {
+        if (art_visible) {
             lv_obj_set_flex_grow(_spacer_top,    k_spacer_grow_with_art_top);
             lv_obj_set_flex_grow(_spacer_bottom, k_spacer_grow_with_art_bottom);
         } else {
@@ -1810,15 +1921,19 @@ void LvglMainScreen::_reloadArtIfNeeded() {
         }
     }
 
-    Serial.printf("[ART] reload: num=%u key='%s' present=%d\n",
-        (unsigned)current_num, key, (int)file_exists);
+    // force=1 identifies the ART_FS_UPDATED path, so a replacement that silently skipped the reload
+    // is distinguishable from one that ran. / force=1 — путь ART_FS_UPDATED.
+    Serial.printf("[ART] reload: force=%d num=%u key='%s' present=%d visible=%d\n",
+        (int)force, (unsigned)current_num, key, (int)file_exists, (int)art_visible);
 }
 
 void LvglMainScreen::reloadStationArtFromLittlefs() {
     // Called from DspTask via ART_FS_UPDATED queue event after WebUI upload_art / remove_art.
+    // The filesystem is authoritative here: the content behind an unchanged key may have been
+    // replaced, so this is the forced path and no guard may skip the re-read.
     // Вызывается из DspTask после ART_FS_UPDATED (upload_art / remove_art через WebUI).
-    _art_reload_forced = true;
-    _reloadArtIfNeeded();
+    // Содержимое могло измениться при том же ключе — это принудительный путь.
+    _reloadArtIfNeeded(true);
 }
 
 void LvglMainScreen::enter() {
@@ -1895,13 +2010,22 @@ void LvglMainScreen::update() {
     // Верхняя полоса — делегирование в wgt_status_line.
     wgt_status_line::update(_status_line);
 
-    snprintf(buf, sizeof(buf), "Vol: %d", config.store.volume);
+    // Label and bar both read the authoritative value (0 while muted); the UI latches no
+    // mute state of its own. Dragging the bar back above 0 unmutes via the normal PR_VOL path.
+    // Метка и бар читают авторитетное значение (0 в MUTE); UI не хранит своего состояния.
+    // Возврат бара выше 0 снимает MUTE обычным путём PR_VOL.
+    const int32_t shown_volume = static_cast<int32_t>(player.audibleVolume());
+    if (player.isMuted()) {
+        snprintf(buf, sizeof(buf), "Vol: MUTE");
+    } else {
+        snprintf(buf, sizeof(buf), "Vol: %d", static_cast<int>(shown_volume));
+    }
     main_set_text_if_changed(_lbl_volume, buf);
 
     // Sync bar from config when volume was changed elsewhere (encoder, WebUI); not during touch drag.
     // Синхронизация бара из config, если громкость менялась не слайдером; во время drag — только lv_bar в callback.
     if (_bar_volume && !s_vol_touch_active) {
-        lv_bar_set_value(_bar_volume, static_cast<int32_t>(config.store.volume), LV_ANIM_OFF);
+        lv_bar_set_value(_bar_volume, shown_volume, LV_ANIM_OFF);
     }
 
     // Lower divider/meter: fill = buffer % when audioinfo enabled AND player running; 0 otherwise.
@@ -1957,10 +2081,11 @@ void LvglMainScreen::update() {
         }
     }
 
-    // Station Art MVP: reload art when station changes.
+    // Station Art MVP: reload art when station changes. Never forced — an ordinary tick must not
+    // re-read LittleFS; ART_FS_UPDATED owns the forced path via reloadStationArtFromLittlefs().
     // Key: stationByNum(lastStation()) — not config.station.name.
-    // Station Art MVP: перезагрузка арта при смене станции (ключ из плейлиста, не runtime name).
-    _reloadArtIfNeeded();
+    // Station Art MVP: перезагрузка арта при смене станции; обычный тик никогда не форсирует чтение.
+    _reloadArtIfNeeded(false);
 }
 
 void LvglMainScreen::liveReapplyTheme() {
@@ -2017,6 +2142,12 @@ void LvglMainScreen::liveReapplyTheme() {
         lv_obj_set_style_bg_color(_lbl_vol_popup,   pal.panel_background, LV_PART_MAIN);
     }
 
+    // Hit-layers: theme reinit reattaches CARD pad/scrollbar styles; flags survive, styles may not.
+    // Hit-layer: reinit темы возвращает CARD; флаги живут, стили — нет. Повторяем sanitize.
+    main_sanitize_hit_layer(_vol_touch_zone);
+    main_sanitize_hit_layer(_vol_gesture_guard);
+    main_sanitize_hit_layer(_screen_bottom_carousel_guard);
+
     // Art slot frame (Main chrome): reuses control_band border token (6.6R-GA) / Рамка арта
     if (_art_slot) {
         lv_obj_set_style_border_color(_art_slot, pal.main_chrome_border, LV_PART_MAIN);
@@ -2028,6 +2159,17 @@ void LvglMainScreen::liveReapplyTheme() {
         lv_obj_set_style_bg_opa(_control_band,       lightScheme ? k_cb_bg_opa_light : k_cb_bg_opa_dark, LV_PART_MAIN);
         lv_obj_set_style_border_color(_control_band, pal.main_chrome_border, LV_PART_MAIN);
         lv_obj_set_style_border_opa(_control_band,   lightScheme ? k_cb_border_opa_light : k_cb_border_opa_dark, LV_PART_MAIN);
+        // Inner flex slots (list / transport / settings) were TRANSPARENT at create(); theme reinit
+        // reapplies opaque card styles. Restore idle transparency without touching layout.
+        // Внутренние слоты в create() прозрачные; reinit делает CARD непрозрачным — вернуть TRANSP.
+        const uint32_t n = lv_obj_get_child_count(_control_band);
+        for (uint32_t i = 0; i < n; i++) {
+            lv_obj_t* ch = lv_obj_get_child(_control_band, i);
+            if (!ch || ch == _edge_glow_top || ch == _edge_glow_bot) continue;
+            lv_obj_set_style_bg_opa(ch, LV_OPA_TRANSP, LV_PART_MAIN);
+            lv_obj_set_style_border_width(ch, 0, LV_PART_MAIN);
+            lv_obj_set_style_shadow_width(ch, 0, LV_PART_MAIN);
+        }
     }
 
     // Rim glow (6.6R-GA): refresh gradient stops + per-theme opacity → no stale glow on switch.
@@ -2140,8 +2282,12 @@ void LvglMainScreen::_nullHandlesAndFreeNonLvgl() {
     _art_img   = nullptr;
     _cont_mid  = nullptr;
     _cont_text = nullptr;
+    // STATION-ART-LVGL9-REPAIR: unlike _bg_psram_buf (borrowed from s_bg_cache), the art buffer is
+    // owned by the page — free it here. _art_img is already gone with the screen tree, so nothing
+    // can still reference the descriptor.
+    // Буфер арта принадлежит странице (в отличие от фона) — освобождаем здесь.
+    _releaseArtBuffer();
     _art_last_station_num = 0xFFFF; // reset sentinel so next create()+update() re-evaluates
-    _art_reload_forced    = false;
     _art_current_key[0]   = '\0';
     _spacer_top    = nullptr;
     _spacer_bottom = nullptr;

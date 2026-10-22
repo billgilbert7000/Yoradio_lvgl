@@ -28,6 +28,7 @@ enum class TextId : uint16_t {
   BootNoSavedWifiNetworks,
   BootSavedWifiConnectionFailed,
   BootConnectedToFormat,
+  BootLoadingBackground,
   BootWifiFallbackName,
   BootOpeningWifiSetup,
   BootReconnectStatus,
@@ -55,8 +56,7 @@ enum class TextId : uint16_t {
   WeatherTemporarilyUnavailable,
   WeatherDataMayBeOutdated,
   WeatherRefreshing,
-  WeatherTapToRefresh,
-  WeatherTapToRetry,
+  WeatherTapToReturnToMain,
   WeatherUpdatedJustNow,
   WeatherUpdatedMinutesAgoFormat,
   WeatherUpdatedHoursAgoFormat,
@@ -369,6 +369,7 @@ inline constexpr std::array<TextSpec, textCount()> kTextSpecs{{
   makeTextSpec("", 64),    // BootNoSavedWifiNetworks
   makeTextSpec("", 112),   // BootSavedWifiConnectionFailed
   makeTextSpec("%s", 64),  // BootConnectedToFormat: connected SSID (32 bytes maximum)
+  makeTextSpec("", 48),    // BootLoadingBackground
   makeTextSpec("", 16),    // BootWifiFallbackName
   makeTextSpec("", 64),    // BootOpeningWifiSetup
   makeTextSpec("", 64),    // BootReconnectStatus: safe non-formatted fallback
@@ -396,8 +397,7 @@ inline constexpr std::array<TextSpec, textCount()> kTextSpecs{{
   makeTextSpec("", 80),    // WeatherTemporarilyUnavailable
   makeTextSpec("", 80),    // WeatherDataMayBeOutdated
   makeTextSpec("", 64),    // WeatherRefreshing
-  makeTextSpec("", 64),    // WeatherTapToRefresh
-  makeTextSpec("", 64),    // WeatherTapToRetry
+  makeTextSpec("", 80),    // WeatherTapToReturnToMain
   makeTextSpec("", 64),    // WeatherUpdatedJustNow
   makeTextSpec("%u", 80),  // WeatherUpdatedMinutesAgoFormat
   makeTextSpec("%u", 80),  // WeatherUpdatedHoursAgoFormat

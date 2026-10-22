@@ -29,9 +29,12 @@
 #include "../../core/player.h"
 #include "../../core/ppm_pcm_level.h"
 #include "../fonts/lv_fonts.h"
+#include "../font_provider.h"
 #include "../profiles/lv_profile_select.h"
 #include "../theme/lv_theme_yoradio.h"
 #include "../widgets/wgt_status_line.h"
+#include "../lv_img_disk_header.h"
+#include "../lv_text_scroll.h"
 #include "lvgl_ui.h"
 
 namespace lvgl_ui {
@@ -73,13 +76,21 @@ static constexpr lv_coord_t kMetaStationX = 19;
 static constexpr lv_coord_t kMetaStationY = 74;
 static constexpr lv_coord_t kMetaStationW = 432;
 static constexpr lv_coord_t kMetaStationH = 28;
-static constexpr lv_coord_t kMetaArtistX  = 40;
+// Artist/song share one box so centered text stays on one axis. With frame_padding=8 the old
+// x=40/w=400 sat at panel 48..448 (visible while song scrolls left-origin): left edge moved 12 px left,
+// right edge unchanged. Song H=22 is below the 18 px font line height ON PURPOSE: LVGL rolls short
+// text vertically (kept by request).
+// Artist/song — одна рамка, чтобы центрированный текст был на одной оси. Со frame_padding=8 старые
+// x=40/w=400 давали 48..448 на панели (видно при скролле песни): левый край сдвинут на 12 px влево,
+// правый не менялся. H=22 у песни меньше высоты строки шрифта НАМЕРЕННО — LVGL прокручивает короткий
+// текст по вертикали (оставлено по решению).
+static constexpr lv_coord_t kMetaArtistX  = 28;
 static constexpr lv_coord_t kMetaArtistY  = 352;
-static constexpr lv_coord_t kMetaArtistW  = 400;
+static constexpr lv_coord_t kMetaArtistW  = 412;
 static constexpr lv_coord_t kMetaArtistH  = 28;
-static constexpr lv_coord_t kMetaSongX    = 40;
+static constexpr lv_coord_t kMetaSongX    = 28;
 static constexpr lv_coord_t kMetaSongY    = 384;
-static constexpr lv_coord_t kMetaSongW    = 400;
+static constexpr lv_coord_t kMetaSongW    = 412;
 static constexpr lv_coord_t kMetaSongH    = 22;
 
 static void visual_set_font(lv_obj_t* obj, const void* font_slot) {
@@ -93,6 +104,9 @@ static void visual_set_text_if_changed(lv_obj_t* lbl, const char* s) {
     const char* cur = lv_label_get_text(lbl);
     if (cur != nullptr && strcmp(cur, s) == 0) return;
     lv_label_set_text(lbl, s);
+    // FU6-A: no-op for station/artist (not registered); recomputes duration for _lbl_song.
+    // FU6-A: для station/artist — no-op (не зарегистрированы); для _lbl_song — пересчёт длительности.
+    text_scroll::notifyTextChanged(lbl);
 }
 
 // In-place split for mutable copy of title (Main UI pattern). / Разбор копии title как на Main.
@@ -107,15 +121,7 @@ static char* visual_split_inplace_at(char* str, const char* sep) {
 // Transport / service titles must not appear as artist/song. / Служебные строки не в artist/song.
 static bool visual_is_transport_title(const char* title) {
     if (!title || title[0] == '\0') return true;
-    if (strstr(title, "[соединение]") != nullptr) return true;
-    if (strstr(title, "[connecting]") != nullptr) return true;
-    if (strstr(title, "(connection)") != nullptr) return true;
-    if (strstr(title, "[готов]") != nullptr) return true;
-    if (strstr(title, "[ready]") != nullptr) return true;
-    if (strstr(title, "[остановлено]") != nullptr) return true;
-    if (strstr(title, "[stopped]") != nullptr) return true;
-    if (strstr(title, "timeout") != nullptr) return true;
-    return false;
+    return isTransientPlaybackTitle(title);
 }
 
 static void visual_style_metadata_label(lv_obj_t* lbl,
@@ -252,6 +258,8 @@ static float hybrid_target_db(uint16_t short_peak,
 // Background helpers / Вспомогательные функции фона
 // ─────────────────────────────────────────────────────────────────────────────
 
+// BASE-LVGL9-MIGRATION C5: on-disk header still the YoRadio 4-byte v8 packed layout (unchanged);
+// translate into the LVGL 9 12-byte lv_image_header_t via lv_img_disk_header.
 static bool bg_load_into_psram(const char* fs_path, uint8_t*& out_buf, lv_img_dsc_t& out_dsc) {
     out_buf = nullptr;
     if (!fs_path || fs_path[0] == '\0') return false;
@@ -260,18 +268,27 @@ static bool bg_load_into_psram(const char* fs_path, uint8_t*& out_buf, lv_img_ds
     if (!f) return false;
 
     const size_t file_sz = static_cast<size_t>(f.size());
-    if (file_sz <= sizeof(lv_img_header_t)) {
+    if (file_sz <= 4) {
         f.close();
         return false;
     }
 
-    lv_img_header_t hdr;
-    if (f.read(reinterpret_cast<uint8_t*>(&hdr), sizeof(hdr)) != sizeof(hdr)) {
+    uint8_t hdr_raw[4];
+    if (f.read(hdr_raw, sizeof(hdr_raw)) != sizeof(hdr_raw)) {
         f.close();
         return false;
     }
 
-    const uint32_t data_size = static_cast<uint32_t>(file_sz - sizeof(hdr));
+    ImgDiskHeader disk_hdr;
+    imgDiskHeaderParse(hdr_raw, disk_hdr);
+    lv_image_header_t lv_hdr;
+    if (!imgDiskHeaderToLvHeader(disk_hdr, lv_hdr)) {
+        f.close();
+        Serial.printf("[VISUAL_BG] unsupported on-disk cf=%u for %s\n", (unsigned)disk_hdr.cf, fs_path);
+        return false;
+    }
+
+    const uint32_t data_size = static_cast<uint32_t>(file_sz - sizeof(hdr_raw));
     uint8_t* buf = static_cast<uint8_t*>(ps_malloc(data_size));
     if (!buf) {
         f.close();
@@ -289,7 +306,7 @@ static bool bg_load_into_psram(const char* fs_path, uint8_t*& out_buf, lv_img_ds
     }
 
     out_buf           = buf;
-    out_dsc.header    = hdr;
+    out_dsc.header    = lv_hdr;
     out_dsc.data_size = data_size;
     out_dsc.data      = buf;
 
@@ -366,7 +383,7 @@ void LvglVisualPage::create_metadata_layer(LvglVisualPage& self, const YoRadioPa
             kMetaStationY,
             kMetaStationW,
             kMetaStationH,
-            reinterpret_cast<const void*>(&lv_font_yora_montserrat_22_cyr),
+            FontProvider::text(22),
             pal.text_secondary,
             LV_TEXT_ALIGN_CENTER);
         lv_label_set_text(self._lbl_station, "");
@@ -380,7 +397,7 @@ void LvglVisualPage::create_metadata_layer(LvglVisualPage& self, const YoRadioPa
             kMetaArtistY,
             kMetaArtistW,
             kMetaArtistH,
-            reinterpret_cast<const void*>(&lv_font_yora_montserrat_22_cyr),
+            FontProvider::text(22),
             pal.text_secondary,
             LV_TEXT_ALIGN_CENTER);
         lv_label_set_text(self._lbl_artist, "");
@@ -394,10 +411,17 @@ void LvglVisualPage::create_metadata_layer(LvglVisualPage& self, const YoRadioPa
             kMetaSongY,
             kMetaSongW,
             kMetaSongH,
-            reinterpret_cast<const void*>(&lv_font_yora_montserrat_18_cyr),
+            FontProvider::text(18),
             pal.text_meta,
             LV_TEXT_ALIGN_CENTER);
         lv_label_set_text(self._lbl_song, "");
+        // FU6-A: only the song/track title is a scroll consumer (station/artist stay LONG_DOT).
+        // Shared helper reads the CENTER alignment set above and restores it whenever the text
+        // fits again; register last, once width/font/alignment are final (contract in lv_text_scroll.h).
+        // FU6-A: скроллится только song/title (station/artist остаются LONG_DOT). Общий хелпер
+        // читает заданное выше CENTER и возвращает его, когда текст снова помещается; регистрируем
+        // последним, когда ширина/шрифт/выравнивание уже заданы.
+        text_scroll::registerLabel(self._lbl_song);
     }
 }
 
@@ -477,7 +501,7 @@ void LvglVisualPage::create_ppm_timer(LvglVisualPage& self) {
 
 void LvglVisualPage::_ppmTimerCallback(lv_timer_t* timer) {
     if (!timer) return;
-    auto* self = static_cast<LvglVisualPage*>(timer->user_data);
+    auto* self = static_cast<LvglVisualPage*>(lv_timer_get_user_data(timer));
     if (self) self->_onPpmTimerTick();
 }
 

@@ -1,21 +1,22 @@
 # YoRadio 4848S040 — PL
 
 - **Board:** 4848S040
-- **Version:** `0.9.434m-r2-lvgl-beta.2`
-- **Source commit:** `538b95553db44884ad0d75e92f3e8970a78e770c`
+- **Version:** `0.9.434m-r2-lvgl-beta.3.01`
+- **Date:** 2026-10-05
+- **Source commit:** `40a8f41519e787a17215807cefaf6dd89ba28530`
 - **UI language:** PL (Polski)
 - **AI prompt in LittleFS:** `ai/ai_prompt_pl.txt` → `/ai/ai_prompt.txt`
-- **Status:** release package ready / pakiet gotowy
+- **Status:** beta.3 release package; physical device smoke after latest RC changes not performed (device unavailable) / fizyczny test na urządzeniu po ostatnich zmianach RC nie był wykonywany
 
 Pliki w tym katalogu:
 
 | Plik | Size (bytes) | SHA256 |
 |---|---:|---|
-| `bootloader.bin` | 20224 | `D4DE4A82B5BB75231586E500AB80A1037303117DE73BABC8BF62276EF307B6DA` |
+| `bootloader.bin` | 19968 | `31B3C1BE45DC5A76AA85C82540D6787B675E711EAF11021A5EEA7E36F469C6DE` |
 | `partitions.bin` | 3072 | `DF213A5DB8BDF71F4744DF0D33A2A61D481314D9AA5EC2B13835D5F3E0C10240` |
 | `boot_app0.bin` | 8192 | `F94C5D786A7A8FAB06AC5D10E33BF37711A6697636DC037559EA19CC410A17F0` |
-| `firmware.bin` | 2935568 | `FB6F58A8FED45293496A9E02A15EEF90631D2EF31A51684AD05F59C23EB5F596` |
-| `littlefs.bin` | 8257536 | `AB72D22E1C3FDF306B694C936E019F391661F9F292CED8F2D85E136BE281088B` |
+| `firmware.bin` | 2815616 | `1C54C889286694111C2354490F4BD331D93C9D9F914A5F57FCC117630A4EE6BA` |
+| `littlefs.bin` | 8257536 | `5FEF2BAF007C52DD17C6762CE24A263ACB69F8D83B1DD00AF75E230607B13441` |
 
 Nie mieszaj z plikami z `RU/`, `EN/` lub `SK/`.
 

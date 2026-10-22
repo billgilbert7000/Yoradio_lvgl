@@ -33,6 +33,8 @@
 #include <NetworkClientSecure.h>
 #include <driver/i2s_std.h>
 #include "audiolib_structs.hpp"
+#include "audio_retry_budget.h"
+#include "audio_tls_sni_client.h"
 
 #ifndef I2S_GPIO_UNUSED
   #define I2S_GPIO_UNUSED -1 // = I2S_PIN_NO_CHANGE in IDF < 5
@@ -62,6 +64,15 @@ extern __attribute__((weak)) void audio_beginSDread();
 extern __attribute__((weak)) void audio_progress(uint32_t startpos, uint32_t endpos);
 extern __attribute__((weak)) void audio_error(const char*);
 //----------------------------------------------------------------------------------------------------------------------
+
+class AudioNetworkClientSecure : public AudioTlsSniClientT<NetworkClientSecure> {
+public:
+#if defined(YORADIO_IDF_C1_CONFIG) && YORADIO_IDF_C1_CONFIG
+    mbedtls_ssl_context* audioSslContext() {
+        return sslclient ? &sslclient->ssl_ctx : nullptr;
+    }
+#endif
+};
 
 class AudioBuffer {
 // AudioBuffer will be allocated in PSRAM
@@ -127,12 +138,15 @@ protected:
 //----------------------------------------------------------------------------------------------------------------------
 
 
+#ifndef YORADIO_AUDIO_TERMINAL_REASON_DEFINED
+#define YORADIO_AUDIO_TERMINAL_REASON_DEFINED
 // E36REC1B: station-local terminal reasons — consumed once by Player / причины terminal stop
 enum class AudioTerminalReason : uint8_t {
     NONE = 0,
     HEADER_RETRY_EXHAUSTED,
     UNSTABLE_STREAM_EXHAUSTED
 };
+#endif
 
 class Audio{
 
@@ -199,6 +213,8 @@ class Audio{
     // E36REC1B: new user playback session — unstable-stream budget only / только счётчик unstable
     void           beginPlaybackSession();
     AudioTerminalReason consumeTerminalReason();
+    bool           isWebstreamReconnectPending() const { return m_f_webstreamReconnectPending; }
+    void           cancelWebstreamReconnect(const char* reason);
     uint32_t     inBufferFilled();            // returns the number of stored bytes in the inputbuffer
 //    uint32_t     inBufferFree();              // returns the number of free bytes in the inputbuffer
 //    uint32_t     getInBufferSize();           // returns the size of the inputbuffer in bytes
@@ -216,12 +232,30 @@ class Audio{
 //    void         info(event_t e, std::vector<uint32_t>& v);
   private:
     void         latinToUTF8(ps_ptr<char>& buff, bool UTF8check = true);
+    void         applyExpectedFormatHints(const char* extension);
     void         htmlToUTF8(char* str);
 // displased
     int32_t      audioFileRead(uint8_t* buff = nullptr, size_t len = 0);
     int32_t      audioFileSeek(uint32_t position, size_t len = 0);
     void         initInBuff();
     bool         httpPrint(const char* host);
+    // E-AT3: single transport connect funnel — resolved IP + original hostname.
+    // E-AT3: единая точка connect — IP из resolver + исходный hostname.
+    bool         audioTransportConnect(const IPAddress& ip, uint16_t port, const char* hostname);
+    // E-AT4: reports whether a physical connect was actually issued, so that the
+    // clean fallback can be accounted for separately.
+    // E-AT4: сообщает, была ли реальная попытка подключения, чтобы clean
+    // fallback учитывался отдельно.
+    bool         tryBufferedWebstreamReconnect(bool& transportAttempted);
+    // E-MP4: codecs whose raw webstream bytes may be de-duplicated across a
+    // reconnect. The matcher itself is byte-exact and knows nothing about codecs;
+    // this is only about which streams are framed suitably for it.
+    // E-MP4: кодеки, чьи сырые байты webstream можно дедуплицировать при
+    // переподключении. Сам матчер побайтовый и о кодеках ничего не знает — здесь
+    // только о том, у каких потоков подходящее обрамление.
+    bool         overlapDedupEligibleCodec() const {
+        return m_codec == CODEC_AAC || m_codec == CODEC_MP3;
+    }
     bool         httpRange(uint32_t range, uint32_t length = UINT32_MAX);
     void         processLocalFile();
     void         processWebStream();
@@ -260,10 +294,24 @@ class Audio{
     void         computeLimit();
     void         Gain(int16_t* sample);
     void         showstreamtitle(char* ml);
+    void         finishPreserveReconnectFallback();   // E-HO2
     bool         parseContentType(char* ct);
+    // E-HO2: the same parser writing into caller-chosen fields. While an old buffer
+    // is still being played out, the response of the replacement connection must
+    // land in staging, never in the live fields the audio task reads.
+    // E-HO2: тот же парсер, пишущий в поля, выбранные вызывающим. Пока
+    // доигрывается старый буфер, ответ нового соединения должен попадать в
+    // staging, а не в живые поля, которые читает аудиозадача.
+    bool         parseContentTypeInto(char* ct, uint8_t& codec, bool& isOgg, uint8_t& plsFmt);
     bool         parseHttpResponseHeader();
     bool         parseHttpRangeHeader();
-    void         tlsPreconnectCleanup();
+    // E-MP1: takes the codec whose decoder must survive the cleanup, because the
+    // audio task keeps decoding the preserved buffer while this runs on the player
+    // task - freeing that decoder underneath it is a use-after-free.
+    // E-MP1: принимает кодек, чей декодер обязан пережить cleanup: аудиозадача
+    // продолжает декодировать сохранённый буфер, пока это выполняется в задаче
+    // Player, и освобождение её декодера — use-after-free.
+    void         tlsPreconnectCleanup(uint8_t preserveCodec = CODEC_NONE);
     bool         initializeDecoder(uint8_t codec);
     esp_err_t    I2Sstart();
     esp_err_t    I2Sstop();
@@ -298,10 +346,39 @@ class Audio{
     boolean      streamDetection(uint32_t bytesAvail);
     // E36REC1B: short-lived stream session tracking / сессия unstable-stream
     void         noteStreamAudioProgress();
-    bool         attemptInternalReconnect();
+    bool         attemptInternalReconnect(bool countTransportAttempt = false);
     void         finishUnstableStreamExhausted();
     void         resetStreamConnectionHealth();
     void         pollStreamStability();
+    void         clearBufferedReconnectPcmWatch();
+    void         pollBufferedReconnectPcmWatch();
+    bool         restartAacAfterBufferedReconnect(uint32_t pcmAgeMs, const char* reason = "pcm_stall");
+    void         resetAacOverlapDiagnostic(bool clearHistory);
+    void         rememberAacWebstreamPayload(const uint8_t* data, size_t len);
+    void         armAacOverlapDiagnostic();
+    void         startAacOverlapDiagnostic();
+    void         stageAacOverlapPayload(const uint8_t* data, size_t len);
+    size_t       filterAacOverlapPayload(uint8_t* data, size_t len);
+    void         pollAacOverlapDiagnostic();
+    void         reportAacOverlapDiagnostic(const char* reason);
+    void         scheduleWebstreamReconnect(bool clientConnected, uint32_t availableBytes);
+    void         pollWebstreamReconnect();
+    // E-VS7: consumes a reopen request published by the audio task.
+    // E-VS7: разбирает запрос на переоткрытие, выставленный аудиозадачей.
+    void         pollVorbisReopenRequest();
+    void         requestVorbisReopenFromAudioTask();
+    // E-HO1: one decode epoch = one stream the audio task is actually decoding.
+    // Bumped where that stream is really torn down (setDefaults), not where a new
+    // one is merely intended (beginPlaybackSession).
+    // E-HO1: одна decode epoch = один поток, который реально декодирует
+    // аудиозадача. Инкремент там, где поток действительно снесён (setDefaults), а
+    // не там, где новый только намечен (beginPlaybackSession).
+    void         beginDecodeEpoch();
+    bool         audioTaskStopGateActive() const { return m_f_audioTaskStopGate; }
+    // E-ST1: the audio task asks for a stop instead of performing one.
+    // E-ST1: аудиозадача просит остановку, а не выполняет её сама.
+    void         requestStopFromAudioTask(const char* reason);
+    void         pollAudioTaskStopRequest();
     uint32_t     m4a_correctResumeFilePos();
     uint32_t     ogg_correctResumeFilePos();
     int32_t      flac_correctResumeFilePos();
@@ -609,7 +686,7 @@ private:
 
     File                  m_audiofile;
     NetworkClient	      client;
-    NetworkClientSecure	  clientsecure;
+    AudioNetworkClientSecure clientsecure;
     NetworkClient*        m_client = nullptr;
 
     SemaphoreHandle_t     mutex_playAudioData;
@@ -788,15 +865,175 @@ private:
     audiolib::phrah_t m_phrah;
     audiolib::sdet_t m_sdet;
     // E36REC1B/C: session unstable-stream budget (not m_lVar.count) / счётчик сессии + latch соединения
-    static constexpr uint8_t  MAX_UNSTABLE_STREAM_FAILURES = 3;
+    static constexpr uint8_t  MAX_UNSTABLE_STREAM_FAILURES = 6;
     static constexpr uint32_t UNSTABLE_STREAM_STABLE_MS    = 15000;
     static constexpr uint32_t PCM_RECENT_MS                = 2000;
+    static constexpr uint32_t WEBSTREAM_RECONNECT_GRACE_MS = 250;
+    static constexpr uint32_t WEBSTREAM_RECONNECT_BACKOFF_MS = 500;
+    static constexpr uint32_t WEBSTREAM_STALL_RECONNECT_MS = 1000;
+    static constexpr uint32_t AAC_WEBSTREAM_PREBUFFER_BYTES = 32 * 1024;
+    // E-FL2: start cushion for Ogg-carried streams, aimed at roughly half a second
+    // of audio. One fixed size cannot serve both a 192 kbit/s Vorbis and a
+    // 1.4 Mbit/s FLAC, so it is derived from the announced bitrate and bounded:
+    // the floor keeps low-bitrate starts from being pointless, the ceiling keeps a
+    // high-bitrate start from feeling slow.
+    // E-FL2: стартовый запас для потоков в контейнере Ogg, ориентир — примерно
+    // полсекунды звука. Одна константа не может обслужить и Vorbis 192 кбит/с, и
+    // FLAC 1,4 Мбит/с, поэтому размер считается от заявленного битрейта и
+    // ограничивается: нижняя граница — чтобы запас не был бессмысленным, верхняя —
+    // чтобы старт на высоком битрейте не казался медленным.
+    // E-FL3: how long any start threshold above maxFrameSize may hold playback back.
+    // E-FL3: сколько любой порог старта выше maxFrameSize может держать старт.
+    static constexpr uint32_t STREAM_START_PREBUFFER_DEADLINE_MS = 5000;
+    // E-HL1: pause between refetches of an HLS playlist that returned no new
+    // segment. Kept at the value the one-shot back-off already used.
+    // E-HL1: пауза между повторными выборками плейлиста HLS, не давшего нового
+    // сегмента. Сохранено значение, которое уже использовала одноразовая пауза.
+    static constexpr uint32_t M3U8_EMPTY_PLAYLIST_BACKOFF_MS = 2000;
+    // E-HL2: how long a playlist may publish nothing before the HLS session is
+    // restarted. Segments here run about 5 s, so this is three missed segments in
+    // a row - clearly not normal, but not yet panic. The worst case a listener can
+    // experience is this window times MAX_UNSTABLE_STREAM_FAILURES, because a
+    // restart cannot revive a playlist that only offers already-played segments;
+    // that product is what keeps the silence bounded, so the two must be read
+    // together.
+    // E-HL2: сколько плейлист может ничего не публиковать до перезапуска сессии
+    // HLS. Сегменты здесь около 5 с, то есть это три пропущенных подряд — уже явно
+    // не норма, но ещё не паника. Худшее, что услышит слушатель, — это окно,
+    // умноженное на MAX_UNSTABLE_STREAM_FAILURES, потому что перезапуск не оживляет
+    // плейлист, отдающий только уже проигранные сегменты; именно это произведение
+    // ограничивает тишину, поэтому читать их надо вместе.
+    static constexpr uint32_t M3U8_STALL_GIVEUP_MS = 15000;
+    // E-HL1: when the current playlist stall began; 0 means it is advancing.
+    // E-HL1: когда начался текущий простой плейлиста; 0 — он обновляется.
+    uint32_t m_m3u8StallBeganMs = 0;
+    static constexpr uint32_t OGG_WEBSTREAM_PREBUFFER_MIN_BYTES = 16 * 1024;
+    // E-FL2: used when the station announces no icy-bitrate. The floor above would
+    // give such a stream only a token cushion - 16 KiB is 0.13 s at ~1 Mbit/s - and
+    // every no-bitrate Ogg station observed here turned out to be high-rate FLAC.
+    // Sized for ~0.5 s at 1 Mbit/s; deliberately below the ceiling, because on a
+    // low-rate stream this only shows up as a slower start.
+    // E-FL2: используется, когда станция не сообщает icy-bitrate. Нижняя граница выше
+    // дала бы такому потоку символический запас — 16 КиБ это 0,13 с при ~1 Мбит/с, —
+    // а все встреченные Ogg-станции без битрейта оказались высокобитрейтным FLAC.
+    // Рассчитано на ~0,5 с при 1 Мбит/с; намеренно ниже верхнего предела, потому что
+    // на низкобитрейтном потоке это проявится только как более медленный старт.
+    static constexpr uint32_t OGG_WEBSTREAM_PREBUFFER_UNKNOWN_BYTES = 64 * 1024;
+    static constexpr uint32_t OGG_WEBSTREAM_PREBUFFER_MAX_BYTES = 96 * 1024;
+    static constexpr uint32_t BUFFERED_RECONNECT_HEADER_TIMEOUT_MS = 2000;
+    static constexpr uint32_t BUFFERED_RECONNECT_PCM_STALL_MS = 2500;
+    static constexpr uint32_t BUFFERED_RECONNECT_PCM_PROBATION_MS = 10000;
+    // E-MP3: fraction of InBuff we let an MP3 stream carry across a reconnect.
+    // 1/4 of 640 KiB is about 10 s at 128 kbit/s - enough to cover a reconnect many
+    // times over, small enough that the ICY title cannot drift far ahead of the audio.
+    // E-MP3: доля InBuff, которую MP3-потоку разрешено пронести через переподключение.
+    // 1/4 от 640 КиБ — примерно 10 с на 128 кбит/с: с запасом перекрывает
+    // переподключение и не даёт ICY-заголовку заметно убежать вперёд звука.
+    static constexpr int32_t  MP3_BUFFERED_RETAIN_DIVISOR = 4;
+    static constexpr uint16_t AAC_OVERLAP_SIGNATURE_BYTES = 1024;
+    static constexpr uint32_t AAC_OVERLAP_SCAN_LIMIT_BYTES = 192 * 1024;
+    static constexpr uint32_t AAC_OVERLAP_STAGING_BYTES = 192 * 1024;
+    static constexpr uint32_t AAC_OVERLAP_FALLBACK_RESTORE_BYTES = 96 * 1024;
+    static constexpr uint32_t AAC_OVERLAP_SCAN_LIMIT_MS = 10000;
     uint8_t  m_unstableStreamFailures     = 0;
+    uint8_t  m_preservedStreamCodec       = CODEC_NONE;
+    // E-HO2: staging for the replacement response. Verified against the preserved
+    // stream before anything live is touched; discarded if incompatible.
+    // E-HO2: staging для ответа нового соединения. Проверяется против
+    // сохранённого потока до изменения живых полей; при несовместимости
+    // отбрасывается.
+    uint8_t  m_stagedCodec                = CODEC_NONE;
+    uint8_t  m_stagedPlaylistFormat       = FORMAT_NONE;
+    bool     m_f_stagedOgg                = false;
+    // E-VS7: cross-task hand-off. sendBytes() runs on the audio task, but the
+    // socket belongs to Audio::loop() on the player task, so the audio side only
+    // publishes a request plus the session it belongs to; the owner task acts on
+    // it and drops anything stale after STOP or a station change.
+    // E-VS7: передача между задачами. sendBytes() работает в аудиозадаче, а сокетом
+    // владеет Audio::loop() в задаче Player, поэтому аудио-сторона только публикует
+    // запрос и сессию, которой он принадлежит; задача-владелец его исполняет и
+    // отбрасывает устаревший после STOP или смены станции.
+    // E-HO1: a request is published and taken as one unit under a short spinlock.
+    // The previous volatile flag was cleared before its session/reason were read,
+    // so a request published in that window kept its flag but lost its payload and
+    // was then dropped as stale. No network, cleanup or wait runs inside the
+    // section - it only copies a POD.
+    // E-HO1: запрос публикуется и забирается целиком под коротким spinlock.
+    // Прежний volatile-флаг снимался до чтения session/reason, поэтому запрос,
+    // опубликованный в этом окне, сохранял флаг, но терял содержимое и дальше
+    // отбрасывался как устаревший. Внутри секции нет ни сети, ни cleanup, ни
+    // ожиданий — только копирование POD.
+    struct AudioTaskRequest {
+        bool        pending = false;
+        uint32_t    epoch   = 0;
+        const char* reason  = nullptr;   // string literal, always valid
+    };
+    portMUX_TYPE      m_audioRequestMux = portMUX_INITIALIZER_UNLOCKED;
+    AudioTaskRequest  m_stopRequest{};
+    AudioTaskRequest  m_vorbisReopenRequest{};
+    uint32_t          m_decodeEpoch     = 1;
+    // E-ST1: stopSong() is a cross-task call by design - it raises m_f_lockInBuffer
+    // and waits for m_f_audioTaskIsDecoding to clear. Called from the audio task
+    // that wait is on itself: it spins out after ~100 ms and then frees the decoder
+    // buffers while that very decoder is on the stack, and closes m_client while the
+    // player task may be inside m_client->read(). So the audio task publishes a
+    // request instead, and Audio::loop() performs the stop.
+    // E-ST1: stopSong() по устройству межзадачный — он поднимает m_f_lockInBuffer и
+    // ждёт сброса m_f_audioTaskIsDecoding. При вызове из аудиозадачи это ожидание
+    // самого себя: оно отваливается по таймауту ~100 мс, после чего освобождает
+    // буферы декодера, находясь внутри него, и закрывает m_client, пока задача
+    // Player может быть в m_client->read(). Поэтому аудиозадача публикует запрос,
+    // а выполняет остановку Audio::loop().
+    // E-HO1: hard gate. m_f_playing=false is not a stop - sendBytes() reads it as
+    // "lost sync", resyncs and resumes decoding and publishing PCM. This gate is
+    // checked by performAudioTask/playAudioData/sendBytes and is the only thing
+    // that actually holds the audio task still until the owner acts.
+    // E-HO1: жёсткий затвор. m_f_playing=false — не остановка: sendBytes()
+    // читает его как «потеряна синхронизация», делает resync и продолжает
+    // декодировать и публиковать PCM. Этот затвор проверяют
+    // performAudioTask/playAudioData/sendBytes, и только он реально удерживает
+    // аудиозадачу до реакции владельца.
+    // E-FL3: when the current connection began waiting for the start threshold;
+    // 0 means the stream is already running.
+    // E-FL3: когда текущее соединение начало ждать стартовый порог;
+    // 0 означает, что поток уже идёт.
+    uint32_t      m_streamStartWaitBeganMs   = 0;
+    volatile bool m_f_audioTaskStopGate      = false;
     bool     m_f_streamHadAudio             = false;
     bool     m_f_shortLivedCounted          = false;
     bool     m_f_streamConnectionStable     = false;
+    bool     m_f_disconnectSnapshotLogged   = false;
+    bool     m_f_webstreamReconnectPending  = false;
+    bool     m_f_preserveStreamReconnect    = false;
+    bool     m_f_bufferedReconnectPcmWatch   = false;
     uint32_t m_streamAudioStartedMs         = 0;
-    uint32_t m_streamLastAudioProgressMs    = 0;
+    std::atomic<uint32_t> m_streamLastAudioProgressMs{0};
+    uint32_t m_playbackSession               = 0;
+    uint32_t m_webstreamReconnectSession     = 0;
+    uint32_t m_webstreamReconnectNextMs      = 0;
+    uint32_t m_bufferedReconnectPcmSession    = 0;
+    uint32_t m_bufferedReconnectPcmStartedMs  = 0;
+    uint8_t  m_aacPayloadTail[AAC_OVERLAP_SIGNATURE_BYTES] = {};
+    uint8_t  m_aacOverlapSignature[AAC_OVERLAP_SIGNATURE_BYTES] = {};
+    uint16_t m_aacOverlapPrefix[AAC_OVERLAP_SIGNATURE_BYTES] = {};
+    ps_ptr<uint8_t> m_aacOverlapStaging;
+    uint16_t m_aacPayloadTailWrite            = 0;
+    uint16_t m_aacPayloadTailCount            = 0;
+    uint16_t m_aacOverlapMatched              = 0;
+    uint16_t m_aacOverlapMatchCount           = 0;
+    uint8_t  m_aacOverlapRetry                = 0;
+    bool     m_f_aacOverlapArmed              = false;
+    bool     m_f_aacOverlapActive             = false;
+    uint32_t m_aacOverlapSession              = 0;
+    uint32_t m_aacOverlapStartedMs            = 0;
+    uint32_t m_aacOverlapScanBytes            = 0;
+    uint32_t m_aacOverlapFirstEnd             = 0;
+    uint32_t m_aacOverlapLastEnd              = 0;
+    uint32_t m_aacOverlapOldInbuf             = 0;
+    uint32_t m_aacOverlapSignatureHash        = 0;
+    uint32_t m_aacOverlapStageWrite           = 0;
+    uint32_t m_aacOverlapStageCount           = 0;
+    uint32_t m_aacOverlapStageTotal           = 0;
     AudioTerminalReason m_terminalReason      = AudioTerminalReason::NONE;
     audiolib::fnsy_t m_fnsy;
 

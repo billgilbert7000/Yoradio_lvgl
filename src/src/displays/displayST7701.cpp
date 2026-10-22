@@ -1,6 +1,6 @@
 /************************************************************************************************
    Display driver for ST7701 (480x480) RGB Panel ESP32-4848S040
-   Block 8-E17/E18B: LVGL product — output_display direct; no Canvas; no legacy draw APIs.
+   Block 8-E17/E18B: LVGL product — direct DisplayPort; no Canvas; no legacy draw APIs.
 ************************************************************************************************/
 
 // Adaptation: Witaliy76 - https://github.com/Witaliy76
@@ -8,23 +8,16 @@
 #if DSP_MODEL == DSP_ST7701
 
 #include "displayST7701.h"
+#include "display_port.h"
+#include "esp_lcd_st7701_backend.h"
 #include <cstring>
 #include "../core/spidog.h"
 #include "../core/config.h"
 #include "../core/network.h"
 #include "../core/display.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 
-#include "Arduino_GFX_Library.h"
-
-extern const uint8_t st7701_type9_init_operations[];
 #if defined(ARDUINO_ARCH_ESP32)
 #include "esp32-hal-ledc.h"
-#endif
-
-#if YORADIO_USE_LVGL && (YORADIO_LVGL_STAGE >= 2)
-#include "../lvgl_ui/lvgl_ui.h"
 #endif
 
 #include "driver/adc.h"
@@ -33,9 +26,11 @@ extern const uint8_t st7701_type9_init_operations[];
 #define TAKE_MUTEX() sdog.takeMutex()
 #define GIVE_MUTEX() sdog.giveMutex()
 
-static Arduino_DataBus* bus = nullptr;
-static Arduino_ESP32RGBPanel* rgbpanel = nullptr;
-static Arduino_RGB_Display* output_display = nullptr;
+// Physical panel state for the log-only lifecycle paths below.
+// Состояние физической панели для log-only путей ниже.
+static inline bool physicalBackendReady() {
+    return yoradio_esp_lcd_st7701::isReady();
+}
 
 #ifndef BATTERY_OFF
 
@@ -97,64 +92,35 @@ DspCore::DspCore() {
 #endif
 }
 
-void DspCore::initDisplay() {
+// BASE-DISP-PORT Slice 2: physical bring-up lives behind DisplayPort::begin();
+// DspCore::initDisplay remains the product entry and preserves call-site parity.
+// BASE-DISP-PORT Slice 2: физический bring-up — за DisplayPort::begin();
+// DspCore::initDisplay остаётся продуктовой точкой входа без смены call-site.
+bool DisplayPort::begin() {
     Serial.println("[ST7701] initDisplay start");
-
-    if (!bus) {
-        Serial.println("[ST7701] Initializing bus...");
-        bus = new Arduino_SWSPI(
-            GFX_NOT_DEFINED, ST7701_CS,
-            ST7701_SCK, ST7701_SDA, GFX_NOT_DEFINED);
-        if (!bus) {
-            Serial.println("[ST7701] Failed to initialize bus!");
-            return;
-        }
+    // Direct esp_lcd is the sole RGB peripheral + framebuffer owner.
+    // Direct esp_lcd — единственный владелец RGB-периферии и FB.
+    Serial.println("[ST7701] backend: direct esp_lcd");
+    // Direct init failure must surface through the existing DisplayPort/init path;
+    // never continue with a null/uninitialized framebuffer.
+    // Сбой прямой инициализации возвращается через существующий путь init;
+    // работа с null/неинициализированным FB запрещена.
+    if (!yoradio_esp_lcd_st7701::begin()) {
+        Serial.println("[ST7701] Direct esp_lcd backend begin FAILED");
+        return false;
+    }
+    if (!yoradio_esp_lcd_st7701::isReady() || !yoradio_esp_lcd_st7701::framebuffer()) {
+        Serial.println("[ST7701] Direct esp_lcd backend not ready / no framebuffer!");
+        return false;
     }
 
-    if (!rgbpanel) {
-        Serial.println("[ST7701] Initializing RGB panel...");
-        rgbpanel = new Arduino_ESP32RGBPanel(
-            ST7701_DE, ST7701_VSYNC, ST7701_HSYNC, ST7701_PCLK,
-            ST7701_R0, ST7701_R1, ST7701_R2, ST7701_R3, ST7701_R4,
-            ST7701_G0, ST7701_G1, ST7701_G2, ST7701_G3, ST7701_G4, ST7701_G5,
-            ST7701_B0, ST7701_B1, ST7701_B2, ST7701_B3, ST7701_B4,
-            1, 10, 8, 50,
-            1, 10, 8, 20,
-            0,
-            10000000UL,
-            false,
-            0, 0, 0);
-        if (!rgbpanel) {
-            Serial.println("[ST7701] Failed to initialize RGB panel!");
-            return;
-        }
-    }
-
-    if (!output_display) {
-        Serial.println("[ST7701] Initializing RGB display...");
-        output_display = new Arduino_RGB_Display(
-            480, 480, rgbpanel, 0, false,
-            bus, GFX_NOT_DEFINED, st7701_type9_init_operations,
-            sizeof(st7701_type9_init_operations));
-        if (!output_display) {
-            Serial.println("[ST7701] Failed to initialize RGB display!");
-            return;
-        }
-    }
-
-    static bool s_rgb_output_begun = false;
-    if (!output_display) {
-        Serial.println("[ST7701] RGB display object missing!");
-        return;
-    }
-    if (!s_rgb_output_begun) {
-        Serial.println("[ST7701] Initializing RGB display output...");
-        if (!output_display->begin()) {
-            Serial.println("[ST7701] Failed to begin RGB display!");
-            return;
-        }
-        s_rgb_output_begun = true;
-        delay(100);
+    // Apply persisted inversion after panel init and before backlight. Direct
+    // orientation is a fixed board option applied before the RGB stream starts.
+    // Инверсия применяется до подсветки; orientation direct-backend фиксируется
+    // board-опцией до запуска RGB stream.
+    if (!yoradio_esp_lcd_st7701::setInverted(config.store.invertdisplay)) {
+        Serial.println("[ST7701] Failed to apply saved display inversion");
+        return false;
     }
 
     pinMode(ST7701_BL, OUTPUT);
@@ -165,22 +131,109 @@ void DspCore::initDisplay() {
 
     Serial.println("[ST7701] initDisplay completed successfully");
 
-    if (s_rgb_output_begun && output_display) {
-        output_display->fillScreen(0);
-        Serial.println("[ST7701] Panel cleared to BLACK (output_display)");
-    }
+    // Direct backend already cleared the FB to black inside begin() (before the
+    // backlight came up); keep the accepted log line for boot-evidence parity.
+    // Прямой backend уже очистил FB в begin() (до включения подсветки).
+    Serial.println("[ST7701] Panel cleared to BLACK (esp_lcd framebuffer)");
 
     Serial.println("[ST7701] Display ready for normal operation");
+    return true;
+}
+
+DisplayGeometry DisplayPort::geometry() {
+    // Proven physical facts only; no new geometry architecture.
+    // Только доказанные физические факты; без новой geometry-архитектуры.
+    return DisplayGeometry{480u, 480u, PixelFormat::Rgb565};
+}
+
+void DisplayPort::flush(const DisplayArea& area, const uint16_t* pixels,
+                        void (*done)(void* ctx), void* ctx) {
+    // Backend-only: no LVGL types, no clip policy, no flush_ready.
+    // Только backend: без типов LVGL, без clip-политики, без flush_ready.
+    if (!physicalBackendReady() || !pixels) {
+        if (done) {
+            done(ctx);
+        }
+        return;
+    }
+
+    // Rectangle geometry is the accepted contract: inclusive area, source treated
+    // as packed with stride = w — identical to what draw16bitRGBBitmap consumed.
+    // Геометрия по принятому контракту: inclusive-область, stride источника = w.
+    const int16_t w = static_cast<int16_t>(area.x2 - area.x1 + 1);
+    const int16_t h = static_cast<int16_t>(area.y2 - area.y1 + 1);
+
+    TAKE_MUTEX();
+    // CPU blit of the invalidated rectangle only into the esp_lcd-owned FB, then
+    // the accepted conservative full-FB C2M writeback.
+    // CPU-блит только изменённого прямоугольника в FB esp_lcd, затем принятый
+    // консервативный полный C2M writeback.
+    yoradio_esp_lcd_st7701::blitRgb565(area.x1, area.y1, pixels, w, h);
+    yoradio_esp_lcd_st7701::cacheWritebackFull();
+    GIVE_MUTEX();
+
+    if (done) {
+        done(ctx);
+    }
+}
+
+void DisplayPort::setBrightness(uint8_t percent) {
+    TAKE_MUTEX();
+    analogWrite(ST7701_BL, map(percent, 0, 100, 0, 255));
+    GIVE_MUTEX();
+}
+
+void DisplayPort::sleep() {
+    Serial.println("[ST7701] sleep");
+    TAKE_MUTEX();
+    // displayOff is currently log-only when the panel is up — preserve exactly.
+    // displayOff сейчас только лог при поднятой панели — сохраняем точно.
+    if (physicalBackendReady()) {
+        Serial.println("[ST7701] Display OFF");
+    }
+    analogWrite(ST7701_BL, 0);
+    GIVE_MUTEX();
+}
+
+void DisplayPort::wake() {
+    Serial.println("[ST7701] wake");
+    TAKE_MUTEX();
+    // displayOn is currently log-only when the panel is up — preserve exactly.
+    // displayOn сейчас только лог при поднятой панели — сохраняем точно.
+    if (physicalBackendReady()) {
+        Serial.println("[ST7701] Display ON");
+    }
+#if defined(ENABLE_BRIGHTNESS_CONTROL)
+    analogWrite(ST7701_BL, map(config.store.brightness, 0, 100, 0, 255));
+#else
+    analogWrite(ST7701_BL, 255);
+#endif
+    GIVE_MUTEX();
+}
+
+void DisplayPort::restartRgbScanout() {
+    // Backend owns the panel handle; upper layers only request a scanout resync.
+    // Backend владеет panel handle; верхние слои только запрашивают ресинхрон.
+    if (!yoradio_esp_lcd_st7701::isReady()) {
+        return;  // panel not up yet / панель ещё не поднята
+    }
+    TAKE_MUTEX();
+    (void)yoradio_esp_lcd_st7701::restartRgbScanout();
+    GIVE_MUTEX();
+}
+
+bool DspCore::initDisplay() {
+    return DisplayPort::begin();
 }
 
 void DspCore::displayOn() {
-    if (output_display) {
+    if (physicalBackendReady()) {
         Serial.println("[ST7701] Display ON");
     }
 }
 
 void DspCore::displayOff() {
-    if (output_display) {
+    if (physicalBackendReady()) {
         Serial.println("[ST7701] Display OFF");
     }
 }
@@ -197,58 +250,43 @@ void DspCore::loop(bool force) {
     (void)force;
 }
 
+// Inversion is live on the direct backend. This panel
+// accepts its 180-degree scan commands only before the RGB stream starts, so
+// direct orientation is the fixed ST7701_BOOT_ORIENTATION_180 board option.
+// Touch orientation remains an independent runtime option.
 void DspCore::flip() {
     TAKE_MUTEX();
-    if (output_display) {
-        output_display->setRotation(config.store.flipscreen ? 2 : 0);
-    }
+    (void)config.store.flipscreen;
+    Serial.println("[ST7701] Runtime flip unavailable; use ST7701_BOOT_ORIENTATION_180");
     GIVE_MUTEX();
 }
 
 void DspCore::invert() {
     TAKE_MUTEX();
-    if (bus) {
-        bus->sendCommand(config.store.invertdisplay ? 0x21 : 0x20);
+    if (!yoradio_esp_lcd_st7701::setInverted(config.store.invertdisplay)) {
+        Serial.println("[ST7701] Runtime inversion command FAILED");
     }
     GIVE_MUTEX();
 }
 
 void DspCore::sleep(void) {
-    Serial.println("[ST7701] sleep");
-    TAKE_MUTEX();
-    displayOff();
-    analogWrite(ST7701_BL, 0);
-    GIVE_MUTEX();
+    DisplayPort::sleep();
 }
 
 void DspCore::wake(void) {
-    Serial.println("[ST7701] wake");
-    TAKE_MUTEX();
-    displayOn();
-#if defined(ENABLE_BRIGHTNESS_CONTROL)
-    analogWrite(ST7701_BL, map(config.store.brightness, 0, 100, 0, 255));
-#else
-    analogWrite(ST7701_BL, 255);
-#endif
-    GIVE_MUTEX();
+    DisplayPort::wake();
 }
 
 void DspCore::setBrightness(uint8_t brightness) {
-    TAKE_MUTEX();
-    analogWrite(ST7701_BL, map(brightness, 0, 100, 0, 255));
-    GIVE_MUTEX();
+    DisplayPort::setBrightness(brightness);
 }
 
 uint16_t DspCore::width() {
-    return 480;
+    return DisplayPort::geometry().width;
 }
 
 uint16_t DspCore::height() {
-    return 480;
-}
-
-Arduino_G* DspCore::getOutputDisplay() {
-    return output_display;
+    return DisplayPort::geometry().height;
 }
 
 #ifndef BATTERY_OFF

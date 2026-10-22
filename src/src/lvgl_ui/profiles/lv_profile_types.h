@@ -36,21 +36,22 @@ struct LvglDisplayProfile {
     bool touch_swap_horizontal_carousel;
 
     // --- LVGL draw buffer / Полосовой буфер отрисовки LVGL ---
-    // a) Strip height in lines (partial buffer). b) USED: lvgl_ui::initDisplayDriver reads buf_lines.
-    // c) Centralizes former magic constant (40). d) Profile foundation, active.
+    // a) Strip height metadata. b) Not read by initDisplayDriver yet; live ST7701 value is 160.
+    // c) Keeps profile metadata aligned for a future driver-policy move. d) Future-facing.
+    // a) Metadata высоты полосы. b) Пока не читается initDisplayDriver; live ST7701 = 160.
     uint16_t buf_lines;
     // a) If true, buffer should live in PSRAM. b) Not read; code always allocates via ps_malloc today.
     // c) Documents intent; future: SRAM fallback or policy switch. d) Future-facing / documentation.
     bool buf_in_psram;
 
-    // --- Font slots (LVGL const lv_font_t* at runtime) / Слоты шрифтов ---
-    // a) Tiered fonts for UI (plan: small/normal/large/clock/header). b) All nullptr; INFO uses lv_font_default().
-    // c) Stage 4.5 per plan ("NULL until Stage 5.1"). d) Foundation reserve for Stage 5.1.
-    const void* font_small;
-    const void* font_normal;
-    const void* font_large;
-    const void* font_clock;
-    const void* font_header;
+    // --- Text size requests (pixels) / Запросы размеров текста (пиксели) ---
+    // The profile selects typography size; FontProvider owns the scalable font
+    // source and runtime lv_font_t instances. These values are not capabilities.
+    uint16_t font_small_px;
+    uint16_t font_normal_px;
+    uint16_t font_large_px;
+    uint16_t font_clock_px;
+    uint16_t font_header_px;
 
     // --- Margins / Поля ---
     // a) Edge inset like legacy TFT_FRAMEWDT (~8 px). b) USED: LvglInfoPage layout (marginLeft = padding*3).

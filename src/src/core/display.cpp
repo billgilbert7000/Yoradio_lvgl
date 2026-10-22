@@ -10,6 +10,7 @@
 #include "player.h"
 #include "network.h"
 #include "../core/spidog.h"
+#include "../displays/display_port.h"
 #include "../lvgl_ui/lvgl_ui.h"
 #include "../lvgl_ui/lv_screensaver.h"
 #include "../lvgl_ui/lv_ui_events.h"
@@ -28,8 +29,8 @@ static uint32_t s_panel_last_flush_ms = 0;
 // Block 8-E18D: markFrameDirty — no-op (legacy Canvas dirty flush removed).
 void markFrameDirty() {}
 
-// Block 8-E3/8.1H-H: panel flush counter on LVGL direct→output_display path.
-// Block 8-E3/8.1H-H: счётчик panel flush при прямом LVGL→output_display.
+// Block 8-E3/8.1H-H: panel flush counter on the LVGL → DisplayPort path.
+// Block 8-E3/8.1H-H: счётчик panel flush на пути LVGL → DisplayPort.
 void lvgl_ui::recordLvglDirectPanelFlush() {
     s_panel_flush_count++;
     s_panel_last_flush_ms = millis();
@@ -76,8 +77,17 @@ bool formatLocalizedTextS(char* destination, size_t capacity,
 
 DspCore dsp;
 
+// BASE-LVGL9-MIGRATION EXEC-01B: raised 6 KiB -> 10 KiB for LVGL 9.
+// LVGL 9's software draw path is deeper than 8.3's: measured DspTask peak usage
+// during Main construction is ~6760 B, which overflowed the old 6144 B stack
+// (canary panic). 10240 B leaves ~3.4 KiB measured margin.
+// EXEC-01B: 6 KiB -> 10 KiB для LVGL 9 (пик ~6760 B при построении Main).
 #ifndef CORE_STACK_SIZE
-  #define CORE_STACK_SIZE  (1024*6)
+  #if YORADIO_DSPTASK_12K
+    #define CORE_STACK_SIZE  (1024*12)
+  #else
+    #define CORE_STACK_SIZE  (1024*10)
+  #endif
 #endif
 #ifndef DSP_TASK_DELAY
   #define DSP_TASK_DELAY  pdMS_TO_TICKS(5)
@@ -125,11 +135,11 @@ void Display::init() {
   _bootStep = 0;
   _suspendFlush = true;
 
-  dsp.initDisplay();
+  const bool display_ok = dsp.initDisplay();
   sleep_timer_init();
 
-  if (!dsp.getOutputDisplay()) {
-    Serial.println("[Display] Failed to initialize display (no output_display)!");
+  if (!display_ok) {
+    Serial.println("[Display] Failed to initialize display backend!");
     return;
   }
 
@@ -273,6 +283,10 @@ void Display::_tryCompleteLvglPlayerHandoff() {
   lvgl_ui::onModeChanged(PLAYER, PLAYER);
   _bootStep = 2;
   _suspendFlush = false;
+  // PageChain requests the late resync only after Main reports LV_EVENT_SCREEN_LOADED.
+  // Do not request here: dismissBoot() may still be inside its fade and onModeChanged()
+  // can immediately route through goTo(Main); the completion seam deduplicates that pair.
+  // Поздний ресинхрон запрашивает PageChain только после фактической загрузки Main.
 }
 
 void Display::_setReturnTicker(uint8_t time_s){
@@ -356,6 +370,30 @@ void Display::copyAIInterpretationForLvgl(char* buf, size_t cap) const {
     strlcpy(buf, _aiPendingText, cap);
 }
 
+void Display::_performRgbResync() {
+  // Sole policy-layer caller of the DisplayPort resync request. The backend forwards it to
+  // esp_lcd, which consumes one pending flag at the next VSYNC; repeat requests coalesce.
+  // Safe no-op while the panel is not ready.
+  // Единственный вызов запроса ресинхрона на уровне политики. Backend передаёт его в esp_lcd,
+  // который снимает один флаг на следующем VSYNC; повторные запросы схлопываются.
+  DisplayPort::restartRgbScanout();
+}
+
+void Display::requestRgbResync() {
+  // Context-aware so every caller can use one API. DspTask-owned callers (LVGL screens, storage
+  // adapters running under LVGL) execute the policy directly: enqueuing from DspTask would add a
+  // pointless round-trip and, with a full queue, would block DspTask on a queue only DspTask
+  // drains. Every other task serializes through the display queue as before.
+  // Контекстно-зависимо, чтобы у всех вызывающих был один API. Вызовы из DspTask выполняются
+  // сразу: постановка в очередь из DspTask — лишний круг, а на полной очереди это заблокировало
+  // бы DspTask на очереди, которую разбирает только он сам. Прочие задачи — через очередь.
+  if (xTaskGetCurrentTaskHandle() == DspTask) {
+    _performRgbResync();
+    return;
+  }
+  putRequest(RGB_RESYNC);
+}
+
 void Display::putRequest(displayRequestType_e type, int payload){
   if(displayQueue==NULL) return;
   requestParams_t request;
@@ -387,6 +425,20 @@ void Display::loop() {
     if (lvgl_ui::tryPresentLvglBootOnFirstDspLoop()) {
       _bootStep = 1;
       _suspendFlush = false;
+      // EARLY startup resync: the RGB panel finished init (and has been streaming) since
+      // DisplayPort::begin() succeeded, well before DspTask was even created — this is the
+      // first DspTask loop iteration, so it is the latest point still strictly before the
+      // Boot screen's first lv_timer_handler() flush later in this same loop() call. Closes
+      // the true-cold-boot window where scanout phase can start desynchronized. The LATE
+      // resync at completed Boot->Main is owned by PageChain and still covers the
+      // config/playlist/NVS tail that runs after this point; the two remain distinct.
+      // РАННИЙ стартовый ресинхрон: RGB-панель завершила init (и уже стримит) с момента
+      // успешного DisplayPort::begin(), задолго до создания DspTask — это первая итерация
+      // цикла DspTask, т.е. последняя точка, ещё строго до первого lv_timer_handler()-flush
+      // экрана Boot дальше в этом же вызове loop(). Закрывает окно истинного холодного
+      // старта, где scanout может начаться рассинхронизированным. ПОЗДНИЙ ресинхрон после
+      // завершённого Boot->Main теперь принадлежит PageChain и покрывает последующий хвост.
+      _performRgbResync();
     } else {
       static bool s_lvgl_boot_present_fail_logged = false;
       if (!s_lvgl_boot_present_fail_logged) {
@@ -450,20 +502,47 @@ void Display::loop() {
           Serial.println("[Display] Processing DSP_START request");
           _start();
           break;
+        // Asset completion handlers below reload/decode the committed file from LittleFS into
+        // PSRAM before the operation is really finished. The resync therefore belongs after the
+        // reload, not at the web-side write — one request covers write + commit + read + apply.
+        // Обработчики ниже дочитывают/декодируют закоммиченный файл из LittleFS в PSRAM, и лишь
+        // тогда операция завершена. Ресинхрон идёт после reload, а не на стороне записи — один
+        // запрос покрывает write + commit + read + apply.
         case MAIN_BG_FS_UPDATED: {
           lvgl_ui::onMainBackgroundSlotCommitted(static_cast<uint8_t>(request.payload));
+          // Repair E2: dest commit still owes recovery; consume after this loop's taskHandler.
+          // Repair E2: dest-commit по-прежнему должен восстановиться — после taskHandler.
+          lvgl_ui::requestRuntimeRgbRecovery();
+          lvgl_ui::noteDisplayBatchBusy();
           break;
         }
         case ART_FS_UPDATED: {
           lvgl_ui::onStationArtCommitted();
+          _performRgbResync();
           break;
         }
         case SET_THEME_PRESET: {
+          // S6-THEME-01: registers the request only. The heavy transaction (theme.dat write,
+          // palette reapply, RGB recovery) runs once per burst on a quiet taskHandler iteration.
+          // S6-THEME-01: только регистрирует запрос. Тяжёлая транзакция (запись theme.dat,
+          // reapply палитры, RGB recovery) — один раз на серию, на спокойной итерации.
           lvgl_ui::onThemePresetChanged(static_cast<uint8_t>(request.payload));
           break;
         }
         case CUSTOM_THEME_FILE_UPDATED: {
           lvgl_ui::onCustomThemeFileUpdated();
+          _performRgbResync();
+          break;
+        }
+        // Queued resync from a non-display task (AI config/prompt persistence, playlist import).
+        // Repair A2+E: same redraw-then-resync contract, consumed after this loop's taskHandler
+        // so ordinary lv_timer_handler cannot paint after the restart. EARLY boot still calls
+        // _performRgbResync() directly (this case is not used there).
+        // Ресинхрон из не-display задачи. A2+E: тот же контракт, но после taskHandler.
+        // Ранний boot по-прежнему зовёт _performRgbResync() напрямую.
+        case RGB_RESYNC: {
+          lvgl_ui::requestRuntimeRgbRecovery();
+          lvgl_ui::noteDisplayBatchBusy();
           break;
         }
         default: break;
@@ -484,10 +563,15 @@ void Display::loop() {
                                          : i18n::text(i18n::TextId::BootWifiFallbackName));
       lvgl_ui::bootScreenSetStatusUtf8(line);
       s_lvgl_boot_connected_latched = true;
+    } else if (s_lvgl_boot_connected_latched && _lvgl_player_handoff_pending) {
+      // Next loops: Loading background... then JPEG cache for the active theme.
+      // Следующие циклы: «Загрузка фона...» и кэш JPEG активной темы.
+      lvgl_ui::bootPrepareActiveMainBackgroundIfNeeded();
     }
   } else {
     s_lvgl_boot_connected_latched = false;
   }
+  lvgl_ui::mainBgPollRuntimeApply();
   if (_mode != SCREENBLANK && _mode != SCREENSAVER) {
     if (_mode == INFO || lvgl_ui::isLvglCarouselOnInfoSlot()) {
       static uint32_t lastInfoRefresh = 0;

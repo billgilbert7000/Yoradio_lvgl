@@ -29,6 +29,8 @@
 #include "esp_wifi.h"
 
 #include "../fonts/lv_fonts.h"
+#include "../lv_text_scroll.h"
+#include "../font_provider.h"
 #include "../profiles/lv_profile_select.h"
 #include "../theme/lv_theme_yoradio.h"
 #include "lvgl_ui.h"
@@ -133,15 +135,13 @@ static const char* const kIconMemory  = reinterpret_cast<const char*>(u8"\uEA88"
 
 // INFO page title: M18 — slightly larger than font_normal (≈16 px), less heavy than font_large (22 px).
 // Шрифт заголовка INFO: M18 — чуть крупнее font_normal (≈16 px), не такой тяжёлый как font_large.
-static const void* const kFontInfoTitle =
-    reinterpret_cast<const void*>(&lv_font_yora_montserrat_18_cyr);
+static const void* kFontInfoTitle() { return FontProvider::text(18); }
 
 // Section-rail icon font — 36 px. Also used as the classification key in info_reapply_tree_colors()
 // to identify icon labels (as opposed to key/value labels) during a theme walk.
 // Шрифт иконок rail — 36 px. Также служит ключом классификации в info_reapply_tree_colors():
 // по нему отличаем icon label от key/value labels при обходе дерева при смене темы.
-static const void* const kFontSectionIcon =
-    reinterpret_cast<const void*>(&lv_font_yora_info_section_icons_36);
+static const void* font_section_icon() { return FontProvider::icon(36); }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Visual and layout constants / Визуальные и геометрические константы
@@ -184,6 +184,9 @@ static void info_set_text_if_changed(lv_obj_t* lbl, const char* s) {
     const char* cur = lv_label_get_text(lbl);
     if (cur != nullptr && strcmp(cur, s) == 0) return;
     lv_label_set_text(lbl, s);
+    // FU6-A: duration depends on the current text width — recompute on a real text change.
+    // FU6-A: длительность зависит от текущей ширины текста — пересчёт при смене текста.
+    text_scroll::notifyTextChanged(lbl);
 }
 
 static void style_transparent_flex(lv_obj_t* o) {
@@ -255,7 +258,7 @@ static void add_kv_row(
     if (k) {
         lv_label_set_text(k, key);
         lv_label_set_long_mode(k, LV_LABEL_LONG_WRAP);
-        info_set_font(k, LV_ACTIVE_PROFILE.font_normal);
+        info_set_font(k, FontProvider::text(LV_ACTIVE_PROFILE.font_normal_px));
         lv_obj_set_style_text_color(k, pal.text_secondary, LV_PART_MAIN);
         lv_obj_set_style_text_align(k, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
         lv_obj_set_width(k, LV_PCT(kKvKeyWidthPct));
@@ -273,7 +276,6 @@ static void add_kv_row(
             lv_obj_set_style_min_width(slot, 0, LV_PART_MAIN);
             v = lv_label_create(slot);
             if (v) {
-                lv_label_set_long_mode(v, LV_LABEL_LONG_SCROLL_CIRCULAR);
                 lv_obj_set_width(v, LV_PCT(100));
             }
         }
@@ -287,9 +289,15 @@ static void add_kv_row(
 
     if (v) {
         lv_label_set_text(v, initial);
-        info_set_font(v, LV_ACTIVE_PROFILE.font_normal);
+        info_set_font(v, FontProvider::text(LV_ACTIVE_PROFILE.font_normal_px));
         lv_obj_set_style_text_color(v, pal.text_primary, LV_PART_MAIN);
         lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
+        // FU6-A: the bounded-slot variant is the auto-scrolling one; the shared helper owns its
+        // long mode, duration and delay. Registered last, once styling is final.
+        // FU6-A: вариант со slot — автоскроллящийся; режим/длительность/задержка из хелпера.
+        if (val_long_mode == InfoKvValueLongMode::ScrollCircular) {
+            text_scroll::registerLabel(v);
+        }
     }
     if (out_val) {
         *out_val = v;
@@ -342,7 +350,7 @@ static lv_obj_t* add_section_rail_block(
     if (lbl_icon) {
         lv_label_set_text(lbl_icon, icon_glyph_utf8);
         lv_label_set_long_mode(lbl_icon, LV_LABEL_LONG_CLIP);
-        info_set_font(lbl_icon, kFontSectionIcon);
+        info_set_font(lbl_icon, font_section_icon());
         lv_obj_set_style_text_color(lbl_icon, pal.text_secondary, LV_PART_MAIN);
         lv_obj_set_style_text_align(lbl_icon, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
         lv_obj_set_width(lbl_icon, LV_PCT(100));
@@ -352,7 +360,7 @@ static lv_obj_t* add_section_rail_block(
     if (lbl_sec) {
         lv_label_set_text(lbl_sec, section_title_en);
         lv_label_set_long_mode(lbl_sec, LV_LABEL_LONG_WRAP);
-        info_set_font(lbl_sec, LV_ACTIVE_PROFILE.font_normal);
+        info_set_font(lbl_sec, FontProvider::text(LV_ACTIVE_PROFILE.font_normal_px));
         lv_obj_set_style_text_color(lbl_sec, pal.text_secondary, LV_PART_MAIN);
         lv_obj_set_style_text_align(lbl_sec, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
         lv_obj_set_width(lbl_sec, LV_PCT(100));
@@ -416,7 +424,7 @@ static void info_mb_one_decimal(uint32_t bytes, unsigned& out_whole, unsigned& o
 // Recursive tree walk — recolors dividers and labels without rebuilding the screen.
 //
 // Classification rules (must match the object tree created by add_section_rail_block / add_kv_row):
-//   label with font == kFontSectionIcon  → section icon    → text_secondary
+//   label with font == font_section_icon()  → section icon    → text_secondary
 //   first label-child of a ROW parent   → key label        → text_secondary
 //   label-child of a COLUMN parent      → section title    → text_secondary
 //   all other labels                    → value labels     → text_primary
@@ -432,7 +440,7 @@ static void info_reapply_tree_colors(lv_obj_t* obj, const YoRadioPalette& pal, l
         if (!ch || ch == skip_subtree) continue;
         if (lv_obj_check_type(ch, &lv_label_class)) {
             const lv_font_t* f = lv_obj_get_style_text_font(ch, LV_PART_MAIN);
-            if (f == static_cast<const lv_font_t*>(kFontSectionIcon)) {
+            if (f == static_cast<const lv_font_t*>(font_section_icon())) {
                 lv_obj_set_style_text_color(ch, pal.text_secondary, LV_PART_MAIN);
             } else {
                 lv_obj_t* parent = lv_obj_get_parent(ch);
@@ -507,7 +515,7 @@ void LvglInfoPage::create_title(LvglInfoPage& self, const YoRadioPalette& pal) {
     self._lbl_info_title = lv_label_create(self._screen);
     if (self._lbl_info_title) {
         lv_label_set_text(self._lbl_info_title, kStrInfoTitle);
-        info_set_font(self._lbl_info_title, kFontInfoTitle);
+        info_set_font(self._lbl_info_title, kFontInfoTitle());
         lv_obj_set_style_text_color(self._lbl_info_title, pal.text_primary, LV_PART_MAIN);
         lv_obj_set_style_text_align(self._lbl_info_title, LV_TEXT_ALIGN_LEFT, LV_PART_MAIN);
     }

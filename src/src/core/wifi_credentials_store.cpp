@@ -5,6 +5,8 @@
 #include "wifi_credentials_store.h"
 
 #include "config.h"
+#include "display.h"
+#include "../lvgl_ui/lvgl_ui.h"
 
 #include <Arduino.h>
 #include <LittleFS.h>
@@ -132,24 +134,34 @@ bool wifiCredStorePersistToFs() {
   if (!fsIsReady()) {
     return false;
   }
+  // This whole-file rewrite is one logical transaction. Open-for-write already mutates
+  // LittleFS (including a mid-loop abort that leaves a truncated file). Repair E: mark runtime
+  // recovery here; do not requestRgbResync on DspTask inside the LVGL click/timer path.
+  // Полная перезапись файла — одна логическая транзакция. open("w") уже мутирует LittleFS,
+  // включая обрыв цикла с усечённым файлом. Repair E: помечаем recovery, без immediate restart.
   File f = LittleFS.open(SSIDS_PATH, "w");
   if (!f) {
     return false;
   }
+  bool ok = true;
   for (uint8_t i = 0; i < config.ssidsCount; i++) {
     const char* s = config.ssids[i].ssid;
     const char* p = config.ssids[i].password;
     if (!wifiCredStoreEntryFitsLegacyFile(s, p)) {
       f.close();
-      return false;
+      ok = false;
+      break;
     }
     f.print(s);
     f.print('\t');
     f.print(p);
     f.print('\n');
   }
-  f.close();
-  return true;
+  if (ok) {
+    f.close();
+  }
+  lvgl_ui::requestRuntimeRgbRecovery();
+  return ok;
 }
 
 uint8_t wifiCredStoreLastSuccessId1() {

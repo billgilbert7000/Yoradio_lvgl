@@ -5,7 +5,7 @@
  * - Implements ILvglScreen: create → enter → update → exit → destroy (+ liveReapplyTheme).
  * - DspTask-only lv_* via Display::loop → lvgl_ui::taskHandler / refreshWeatherScreen().
  * - Data: weatherGetStateSnapshot() ONLY (W1 double-buffer seqlock). No network from UI.
- *   A2b: footer tap calls weatherRequestManualRefresh() (async flag only; HTTP in doSync).
+ *   FU4.2.25: footer tap returns to Main via PageChain (deferred); refresh is automatic only.
  * - Layout: LV_ACTIVE_PROFILE + yoradio_palette() only; reuse OWM glyph map + weather icon fonts.
  *
  * Accepted W2 narrowing (no WeatherState change):
@@ -30,6 +30,7 @@
 // Author: Witaliy76 - https://github.com/Witaliy76
 #include "scr_weather.h"
 #include "../widgets/wgt_footer_pill.h"
+#include "../lv_text_scroll.h"
 
 #include "lvgl.h"
 #include "Arduino.h"
@@ -38,26 +39,20 @@
 #include <time.h>
 
 #include "../fonts/lv_fonts.h"
+#include "../font_provider.h"
 #include "../profiles/lv_profile_select.h"
 #include "../theme/lv_theme_yoradio.h"
 #include "../weather_owm_glyph.h"
 #include "lvgl_ui.h"
-#include "../../core/config.h"   // pulls options.h → myoptions.h (YORADIO_WEATHER_UI_DIAG)
+#include "../lv_page_chain.h"
+#include "../../core/config.h"
 #include "../../core/network.h"  // A3.1: network.timeinfo (NTP-synced local date, read-only) / дата из NTP
-#include "../../core/weather_fetch.h"  // A2b: weatherRequestManualRefresh() / async refresh flag
 #include "../../core/weather_state.h"
 #include "../../i18n/i18n.h"
 
 // W2D: gated LVGL/heap diagnostics for the gradient-OOM investigation. Default OFF — set
-// YORADIO_WEATHER_UI_DIAG=1 in myoptions.h (local, not committed) to capture transition logs.
 // W2D: gated диагностика LVGL/кучи под расследование OOM градиента. По умолчанию выкл.
-#ifndef YORADIO_WEATHER_UI_DIAG
-#define YORADIO_WEATHER_UI_DIAG 0
-#endif
 
-#if YORADIO_WEATHER_UI_DIAG
-#include <esp_heap_caps.h>
-#endif
 
 namespace lvgl_ui {
 
@@ -66,37 +61,6 @@ namespace {
 // ─────────────────────────────────────────────────────────────────────────────
 // Diagnostics (gated) / Диагностика (под флагом)
 // ─────────────────────────────────────────────────────────────────────────────
-#if YORADIO_WEATHER_UI_DIAG
-// Recursive LVGL object counter under a root (root included). Diagnostics only.
-// Рекурсивный счётчик объектов LVGL под корнем (с корнем). Только диагностика.
-static uint32_t wx_diag_count_objs(lv_obj_t* root) {
-    if (!root) return 0;
-    uint32_t n = 1;
-    const uint32_t c = lv_obj_get_child_cnt(root);
-    for (uint32_t i = 0; i < c; ++i) {
-        n += wx_diag_count_objs(lv_obj_get_child(root, i));
-    }
-    return n;
-}
-
-// One-line snapshot: LVGL pool monitor + internal/PSRAM heap + object count under root.
-// LVGL pool (LV_MEM_SIZE 48K, LV_GRAD_CACHE_DEF_SIZE 0) is where rect gradients allocate.
-// Срез в одну строку: монитор пула LVGL + internal/PSRAM + число объектов под корнем.
-static void wx_diag_dump(const char* tag, lv_obj_t* root) {
-    lv_mem_monitor_t mon;
-    lv_mem_monitor(&mon);
-    const uint32_t objs = wx_diag_count_objs(root);
-    Serial.printf("[WX_UI_DIAG] %s objs=%lu | lvpool free=%lu biggest=%lu used=%u%% frag=%u%% "
-                  "| int_free=%u int_big=%u psram_free=%u psram_big=%u\n",
-                  tag, (unsigned long)objs,
-                  (unsigned long)mon.free_size, (unsigned long)mon.free_biggest_size,
-                  (unsigned)mon.used_pct, (unsigned)mon.frag_pct,
-                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
-                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM));
-}
-#endif // YORADIO_WEATHER_UI_DIAG
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Compile-time localized UI ownership / Владение compile-time локализацией UI
@@ -109,21 +73,21 @@ static void wx_diag_dump(const char* tag, lv_obj_t* root) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Font / icon resources / Шрифты и иконки
 // ─────────────────────────────────────────────────────────────────────────────
-// A3: font ladder — hero 64 px; strip forecast 36 px; metric icons 26 px (discrete lv_font_conv sizes).
-// A3: лестница шрифтов — hero 64 пкс; прогноз 36 пкс; метрики 26 пкс (дискретные размеры).
-static const void* k_font_hero_icon    = reinterpret_cast<const void*>(&lv_font_yora_weather_icons_64);
-static const void* k_font_daily_icon   = reinterpret_cast<const void*>(&lv_font_yora_weather_icons_36); // daily wx / посуточная погода
-static const void* k_font_daily_pop    = reinterpret_cast<const void*>(&lv_font_yora_weather_metric_icons_22); // umbrella / зонт
-static const void* k_font_daily_day    = reinterpret_cast<const void*>(&lv_font_yora_montserrat_14_cyr); // daily date header / дата в карточке (+2 px over caption)
-static const void* k_font_hourly_icon  = reinterpret_cast<const void*>(&lv_font_yora_weather_icons_28);
-static const void* k_font_hourly_pop   = reinterpret_cast<const void*>(&lv_font_yora_weather_metric_icons_22); // umbrella / зонт
-static const void* k_font_daily_range  = reinterpret_cast<const void*>(&lv_font_yora_montserrat_16_cyr); // tmin° / tmax°
-static const void* k_font_metric_icon  = reinterpret_cast<const void*>(&lv_font_yora_weather_metric_icons_26);
-static const void* k_font_metric_value = reinterpret_cast<const void*>(&lv_font_yora_montserrat_14_cyr); // narrow cells / узкие ячейки
-static const void* k_font_hero_temp  = reinterpret_cast<const void*>(&lv_font_yora_montserrat_40_cyr);
-static const void* k_font_cond       = reinterpret_cast<const void*>(&lv_font_yora_montserrat_16_cyr);
-static const void* k_font_small      = reinterpret_cast<const void*>(&lv_font_yora_montserrat_14_cyr);
-static const void* k_font_caption    = reinterpret_cast<const void*>(&lv_font_yora_montserrat_12_cyr);
+// Hero / forecast / metric icons: runtime pixel requests from the one Tabler subset.
+// Hero / прогноз / метрики: runtime-запросы px из одного Tabler subset.
+static const void* font_hero_icon() { return FontProvider::icon(64); }
+static const void* font_daily_icon() { return FontProvider::icon(36); } // daily wx / посуточная погода
+static const void* font_daily_pop() { return FontProvider::icon(22); } // umbrella / зонт
+static const void* font_daily_day() { return FontProvider::text(14); } // daily date header / дата в карточке
+static const void* font_hourly_icon() { return FontProvider::icon(28); }
+static const void* font_hourly_pop() { return FontProvider::icon(22); } // umbrella / зонт
+static const void* font_daily_range() { return FontProvider::text(16); } // tmin° / tmax°
+static const void* font_metric_icon() { return FontProvider::icon(26); }
+static const void* font_metric_value() { return FontProvider::text(14); } // narrow cells / узкие ячейки
+static const void* font_hero_temp() { return FontProvider::text(40); }
+static const void* font_condition() { return FontProvider::text(16); }
+static const void* font_small() { return FontProvider::text(14); }
+static const void* font_caption() { return FontProvider::text(12); }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Visual constants / Визуальные константы
@@ -147,7 +111,18 @@ static constexpr lv_coord_t kHeroInnerPadLeft = 16;
 // Fixed slot heights — keep icon / value / label rows aligned across all 4 metric cells.
 // Фиксированные высоты слотов — иконки и подписи на одной линии во всех ячейках.
 static constexpr lv_coord_t k_metric_icon_slot_h  = 26;
-static constexpr lv_coord_t k_metric_value_slot_h = 18;
+// 18→20: TinyTTF text(14) line_height=17 + 'g' AA descender needs a 1–2 px safety margin.
+// 18→20: TinyTTF text(14) line_height=17 + AA-вынос 'g' требует запас 1–2 px.
+static constexpr lv_coord_t k_metric_value_slot_h = 20;
+// Bounded pressure value width: factory "799 mmHg" needs ~90 px at TinyTTF 14
+// (84 still clipped the trailing 'g' of "731 mmHg"); keep a small user.ttf margin.
+// Slot/cell stay OVERFLOW_VISIBLE so the centered label may use the inter-cell gutter
+// toward rain — precipitation shifts right in the shared metrics row.
+// text_scroll clips/scrolls inside this bound — never paints past it into neighbors.
+// Фикс. ширина давления: factory «799 mmHg» ≈ 90 px при TinyTTF 14
+// (84 всё ещё обрезало «g» у «731 mmHg»); запас под user.ttf.
+// OVERFLOW_VISIBLE на slot/cell — центрированная метка использует gutter к осадкам.
+static constexpr lv_coord_t k_metric_pressure_value_w = 96;
 static constexpr lv_coord_t k_metric_label_slot_h = 17;
 // A3.1j: synced top row + small bump over pre-A3.1i baseline (hero/hourly readable).
 // A3.1j: выравнивание top row + небольшой прирост над baseline до A3.1i.
@@ -240,9 +215,13 @@ static void wx_format_hero_date(char* buf, size_t cap, const struct tm* tm, lv_c
                       i18n::text(i18n::TextId::WeatherHeroDateFullFormat),
                       tm->tm_mday, month, tm->tm_year + 1900, weekday);
 
-    const lv_font_t* cap_font = static_cast<const lv_font_t*>(k_font_caption);
+    const lv_font_t* cap_font = static_cast<const lv_font_t*>(font_caption());
     if (max_text_w > 0) {
-        const lv_coord_t fw = lv_txt_get_width(full, strlen(full), cap_font, 0, LV_TEXT_FLAG_NONE);
+        // BASE-LVGL9-MIGRATION C7: lv_txt_get_width's v8-compat alias target (lv_text_get_width)
+        // is a private v9 API; use the public lv_text_get_size (unwrapped: max_width=LV_COORD_MAX).
+        lv_point_t full_sz;
+        lv_text_get_size(&full_sz, full, cap_font, 0, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+        const lv_coord_t fw = full_sz.x;
         if (fw > max_text_w) {
             wx_format_checked(buf, cap, today,
                               i18n::text(i18n::TextId::WeatherHeroDateCompactFormat),
@@ -582,8 +561,10 @@ static lv_obj_t* add_metric_slot(lv_obj_t* cell, lv_coord_t slot_h, const void* 
     return slot;
 }
 
-// A3: equal-width column (flex_grow 1) — four cells span full hero metrics row.
-// A3: колонка равной ширины (flex_grow 1) — 4 ячейки на всю ширину hero.
+// A3: equal-width column (flex_grow 4) — four cells span full hero metrics row.
+// Pressure later bumps to 5 so "mmHg" keeps the trailing glyph and rain sits farther right.
+// A3: колонка равной ширины (flex_grow 4) — 4 ячейки на всю ширину hero.
+// Давление потом получает 5 — «mmHg» целиком, осадки чуть правее.
 static void add_metric_cell(lv_obj_t* row, const char* icon_glyph, const char* label_text,
                             lv_obj_t** out_val, lv_obj_t** out_lbl, const YoRadioPalette& pal) {
     if (!row) return;
@@ -591,7 +572,7 @@ static void add_metric_cell(lv_obj_t* row, const char* icon_glyph, const char* l
     if (!cell) return;
     wx_flat_base(cell);
     lv_obj_set_height(cell, LV_SIZE_CONTENT);
-    lv_obj_set_flex_grow(cell, 1);
+    lv_obj_set_flex_grow(cell, 4);
     lv_obj_set_style_min_width(cell, 0, LV_PART_MAIN);
     lv_obj_set_flex_flow(cell, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(cell, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -599,17 +580,17 @@ static void add_metric_cell(lv_obj_t* row, const char* icon_glyph, const char* l
     lv_obj_set_style_pad_hor(cell, 0, LV_PART_MAIN);
 
     lv_obj_t* icon_lbl = nullptr;
-    add_metric_slot(cell, k_metric_icon_slot_h, k_font_metric_icon, pal.text_secondary,
+    add_metric_slot(cell, k_metric_icon_slot_h, font_metric_icon(), pal.text_secondary,
                     LV_LABEL_LONG_CLIP, false, &icon_lbl);
     if (icon_lbl && icon_glyph) {
         lv_label_set_text(icon_lbl, icon_glyph);
     }
-    add_metric_slot(cell, k_metric_value_slot_h, k_font_metric_value, pal.text_primary,
+    add_metric_slot(cell, k_metric_value_slot_h, font_metric_value(), pal.text_primary,
                     LV_LABEL_LONG_CLIP, false, out_val);
     lv_obj_t* cap_lbl = nullptr;
     // A3.1a: caption uses content width — avoids rounding clip on «Влажность» (ь).
     // A3.1a: подпись по ширине текста — без обрезки «ь» у «Влажность».
-    add_metric_slot(cell, k_metric_label_slot_h, k_font_caption, pal.text_secondary,
+    add_metric_slot(cell, k_metric_label_slot_h, font_caption(), pal.text_secondary,
                     LV_LABEL_LONG_CLIP, true, &cap_lbl);
     if (cap_lbl && label_text) {
         lv_label_set_text(cap_lbl, label_text);
@@ -618,6 +599,29 @@ static void add_metric_cell(lv_obj_t* row, const char* icon_glyph, const char* l
         lv_obj_set_style_text_line_space(cap_lbl, 0, LV_PART_MAIN);
     }
     if (out_lbl) *out_lbl = cap_lbl;
+}
+
+// Pressure value: bounded width + overflow-visible parents + shared text_scroll fallback.
+// Factory NNN mmHg fits statically inside k_metric_pressure_value_w; wider user.ttf scrolls
+// only when global Scrolling is On and text exceeds the bound (Off → CLIP inside the bound).
+// Давление: фикс. ширина + OVERFLOW_VISIBLE у родителей + общий text_scroll.
+// Factory NNN mmHg статичен; более широкий user.ttf скроллится только при включённом
+// глобальном Scrolling и переполнении (Off → CLIP внутри границы).
+static void wx_metric_pressure_value_setup(lv_obj_t* val) {
+    if (!val) return;
+    lv_obj_set_width(val, k_metric_pressure_value_w);
+    lv_obj_t* slot = lv_obj_get_parent(val);
+    if (slot) lv_obj_add_flag(slot, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+    lv_obj_t* cell = slot ? lv_obj_get_parent(slot) : nullptr;
+    if (cell) {
+        lv_obj_add_flag(cell, LV_OBJ_FLAG_OVERFLOW_VISIBLE);
+        // 5 vs sibling 4 — modest extra share so rain moves right without squeezing wind/humidity.
+        // 5 против соседних 4 — чуть больше доля давления, осадки правее без сжатия ветра/влажности.
+        lv_obj_set_flex_grow(cell, 5);
+    }
+    // Register last — width/font/align already final (FU6-A contract).
+    // Регистрация последней — ширина/шрифт/выравнивание уже финальны.
+    text_scroll::registerLabel(val);
 }
 
 // A3b: hourly row — time (left, wide gap) | compact group: wx icon | temp | umbrella | pop%.
@@ -639,7 +643,7 @@ static lv_obj_t* add_hourly_row(lv_obj_t* col, const YoRadioPalette& pal,
     lv_obj_t* time = lv_label_create(row);
     if (time) {
         lv_label_set_text(time, "--");
-        wx_set_font(time, k_font_caption);
+        wx_set_font(time, font_caption());
         lv_obj_set_style_text_color(time, pal.text_secondary, LV_PART_MAIN);
         lv_obj_set_style_min_width(time, 40, LV_PART_MAIN);
         lv_obj_set_style_pad_right(time, 3, LV_PART_MAIN); // gap after time / отступ после времени (was 7)
@@ -658,24 +662,26 @@ static lv_obj_t* add_hourly_row(lv_obj_t* col, const YoRadioPalette& pal,
         lv_obj_set_style_pad_column(group, 2, LV_PART_MAIN);
     }
 
-    auto make_in_group = [&](const void* font, lv_color_t col) -> lv_obj_t* {
+    auto make_in_group = [&](const void* font, lv_color_t col, const char* initial) -> lv_obj_t* {
         if (!group) return nullptr;
         lv_obj_t* l = lv_label_create(group);
         if (!l) return nullptr;
-        lv_label_set_text(l, "--");
+        lv_label_set_text(l, initial);
         wx_set_font(l, font);
         lv_obj_set_style_text_color(l, col, LV_PART_MAIN);
         lv_label_set_long_mode(l, LV_LABEL_LONG_CLIP);
         return l;
     };
 
-    lv_obj_t* icon     = make_in_group(k_font_hourly_icon, pal.status_weather_icon);
-    lv_obj_t* temp     = make_in_group(k_font_small, pal.text_primary);
-    lv_obj_t* pop_icon = make_in_group(k_font_hourly_pop, pal.text_secondary);
+    // Tabler PUA-only: ASCII "--" on icon(28) makes TinyTTF log cache-not-allocated (U+002D missing).
+    // Tabler только PUA: ASCII "--" на icon(28) даёт cache-not-allocated (нет U+002D).
+    lv_obj_t* icon     = make_in_group(font_hourly_icon(), pal.status_weather_icon, "");
+    lv_obj_t* temp     = make_in_group(font_small(), pal.text_primary, "--");
+    lv_obj_t* pop_icon = make_in_group(font_hourly_pop(), pal.text_secondary, "--");
     if (pop_icon) {
         lv_label_set_text(pop_icon, YORA_WEATHER_METRIC_GLYPH_UMBRELLA);
     }
-    lv_obj_t* pop = make_in_group(k_font_caption, pal.text_secondary);
+    lv_obj_t* pop = make_in_group(font_caption(), pal.text_secondary, "--");
 
     if (out_time)     *out_time     = time;
     if (out_icon)     *out_icon     = icon;
@@ -714,9 +720,9 @@ static lv_obj_t* add_daily_cell(lv_obj_t* row, const YoRadioPalette& pal,
         return l;
     };
 
-    lv_obj_t* day   = make_label(k_font_daily_day, pal.text_secondary);
-    lv_obj_t* icon  = make_label(k_font_daily_icon, pal.status_weather_icon);
-    lv_obj_t* range = make_label(k_font_daily_range, pal.text_primary);
+    lv_obj_t* day   = make_label(font_daily_day(), pal.text_secondary);
+    lv_obj_t* icon  = make_label(font_daily_icon(), pal.status_weather_icon);
+    lv_obj_t* range = make_label(font_daily_range(), pal.text_primary);
 
     // Precipitation row: umbrella glyph + percent (centered cluster).
     // Строка осадков: зонт + процент (центрированная группа).
@@ -736,14 +742,14 @@ static lv_obj_t* add_daily_cell(lv_obj_t* row, const YoRadioPalette& pal,
         pop_icon = lv_label_create(pop_row);
         if (pop_icon) {
             lv_label_set_text(pop_icon, YORA_WEATHER_METRIC_GLYPH_UMBRELLA);
-            wx_set_font(pop_icon, k_font_daily_pop);
+            wx_set_font(pop_icon, font_daily_pop());
             lv_obj_set_style_text_color(pop_icon, pal.text_secondary, LV_PART_MAIN);
             lv_label_set_long_mode(pop_icon, LV_LABEL_LONG_CLIP);
         }
         pop = lv_label_create(pop_row);
         if (pop) {
             lv_label_set_text(pop, "");
-            wx_set_font(pop, k_font_caption);
+            wx_set_font(pop, font_caption());
             lv_obj_set_style_text_color(pop, pal.text_secondary, LV_PART_MAIN);
             lv_label_set_long_mode(pop, LV_LABEL_LONG_CLIP);
         }
@@ -801,6 +807,9 @@ static void wx_set_text_if_changed(lv_obj_t* lbl, const char* s) {
     const char* cur = lv_label_get_text(lbl);
     if (cur != nullptr && strcmp(cur, s) == 0) return;
     lv_label_set_text(lbl, s);
+    // FU6-A: duration depends on the current text width — recompute on a real text change.
+    // FU6-A: длительность зависит от текущей ширины текста — пересчёт при смене текста.
+    text_scroll::notifyTextChanged(lbl);
 }
 
 static void wx_show(lv_obj_t* obj, bool show) {
@@ -860,31 +869,31 @@ static void wx_format_footer(char* buf, size_t cap, bool wx_enabled, bool have_d
     if (!wx_enabled) {
         wx_format_footer_action(buf, cap,
                                 i18n::text(i18n::TextId::WeatherUnavailable),
-                                i18n::text(i18n::TextId::WeatherTapToRetry), nullptr);
+                                i18n::text(i18n::TextId::WeatherTapToReturnToMain), nullptr);
         return;
     }
     if (resource_deferred) {
         wx_format_footer_action(buf, cap,
                                 i18n::text(i18n::TextId::WeatherMemoryDeferredStatus),
-                                i18n::text(i18n::TextId::WeatherTapToRefresh), loc_p);
+                                i18n::text(i18n::TextId::WeatherTapToReturnToMain), loc_p);
         return;
     }
     if (!have_data) {
         if (unavailable_no_data) {
             wx_format_footer_action(
                 buf, cap, i18n::text(i18n::TextId::WeatherTemporarilyUnavailable),
-                i18n::text(i18n::TextId::WeatherTapToRetry), nullptr);
+                i18n::text(i18n::TextId::WeatherTapToReturnToMain), nullptr);
         } else {
             wx_format_footer_action(buf, cap,
                                     i18n::text(i18n::TextId::WeatherForecastNotLoaded),
-                                    i18n::text(i18n::TextId::WeatherTapToRefresh), nullptr);
+                                    i18n::text(i18n::TextId::WeatherTapToReturnToMain), nullptr);
         }
         return;
     }
     if (effective_stale) {
         wx_format_footer_action(buf, cap,
                                 i18n::text(i18n::TextId::WeatherDataMayBeOutdated),
-                                i18n::text(i18n::TextId::WeatherTapToRefresh), loc_p);
+                                i18n::text(i18n::TextId::WeatherTapToReturnToMain), loc_p);
         return;
     }
     char age[kFooterAgeCap];
@@ -893,7 +902,7 @@ static void wx_format_footer(char* buf, size_t cap, bool wx_enabled, bool have_d
     // E33: no trailing sep — appended by caller only if text overflows the label.
     // E33: trailing sep убран — вызывающий добавит только если текст переполняет label.
     wx_format_checked(inner, sizeof(inner), age, "%s%s%s", age, kStrFooterSep,
-                      i18n::text(i18n::TextId::WeatherTapToRefresh));
+                      i18n::text(i18n::TextId::WeatherTapToReturnToMain));
     wx_footer_prepend_location(buf, cap, loc_p, inner);
 }
 
@@ -908,9 +917,11 @@ static void wx_footer_maybe_add_trailing_sep(char* buf, size_t cap, lv_obj_t* la
     const lv_coord_t letter_space = lv_obj_get_style_text_letter_space(label, LV_PART_MAIN);
     const lv_coord_t avail = lv_obj_get_content_width(label);
     if (avail <= 0) return;  // layout not yet valid — skip, no trailing sep
-    const size_t len = strlen(buf);
-    const lv_coord_t text_w = lv_txt_get_width(
-        buf, static_cast<uint32_t>(len), font, letter_space, LV_TEXT_FLAG_NONE);
+    // BASE-LVGL9-MIGRATION C7: see wx_format_hero_date — public lv_text_get_size replaces the
+    // private-API-only lv_txt_get_width compat alias target.
+    lv_point_t text_sz;
+    lv_text_get_size(&text_sz, buf, font, letter_space, 0, LV_COORD_MAX, LV_TEXT_FLAG_NONE);
+    const lv_coord_t text_w = text_sz.x;
     if (text_w > avail) {
         wx_append_complete(buf, cap, kStrFooterSep);
     }
@@ -1017,7 +1028,7 @@ void LvglWeatherPage::create_data_block(LvglWeatherPage& self, const YoRadioPale
                 if (self._lbl_hero_date) {
                     lv_label_set_text(self._lbl_hero_date,
                                       i18n::text(i18n::TextId::WeatherToday));
-                    wx_set_font(self._lbl_hero_date, k_font_caption);
+                    wx_set_font(self._lbl_hero_date, font_caption());
                     lv_obj_set_style_text_color(self._lbl_hero_date, pal.text_meta, LV_PART_MAIN);
                     lv_obj_set_width(self._lbl_hero_date, LV_PCT(100));
                     lv_label_set_long_mode(self._lbl_hero_date, LV_LABEL_LONG_CLIP);
@@ -1039,7 +1050,7 @@ void LvglWeatherPage::create_data_block(LvglWeatherPage& self, const YoRadioPale
                     self._lbl_hero_icon = lv_label_create(hero_inner);
                     if (self._lbl_hero_icon) {
                         lv_label_set_text(self._lbl_hero_icon, "");
-                        wx_set_font(self._lbl_hero_icon, k_font_hero_icon);
+                        wx_set_font(self._lbl_hero_icon, font_hero_icon());
                         lv_obj_set_style_text_color(self._lbl_hero_icon, pal.status_weather_icon, LV_PART_MAIN);
                         lv_obj_set_flex_grow(self._lbl_hero_icon, 0);
                     }
@@ -1058,7 +1069,7 @@ void LvglWeatherPage::create_data_block(LvglWeatherPage& self, const YoRadioPale
                         self._lbl_hero_temp = lv_label_create(hero_text);
                         if (self._lbl_hero_temp) {
                             lv_label_set_text(self._lbl_hero_temp, "--");
-                            wx_set_font(self._lbl_hero_temp, k_font_hero_temp);
+                            wx_set_font(self._lbl_hero_temp, font_hero_temp());
                             lv_obj_set_style_text_color(self._lbl_hero_temp, pal.text_primary, LV_PART_MAIN);
                             lv_obj_set_style_text_align(self._lbl_hero_temp, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
                         }
@@ -1067,16 +1078,18 @@ void LvglWeatherPage::create_data_block(LvglWeatherPage& self, const YoRadioPale
                             lv_label_set_text(self._lbl_hero_cond, "");
                             // A3.1B: bounded width + circular scroll on overflow only (Main/Info pattern).
                             // A3.1B: фиксированная ширина + круговой скролл только при переполнении.
-                            lv_label_set_long_mode(self._lbl_hero_cond, LV_LABEL_LONG_SCROLL_CIRCULAR);
                             lv_obj_set_width(self._lbl_hero_cond, LV_PCT(100));
-                            wx_set_font(self._lbl_hero_cond, k_font_cond);
+                            wx_set_font(self._lbl_hero_cond, font_condition());
                             lv_obj_set_style_text_color(self._lbl_hero_cond, pal.text_secondary, LV_PART_MAIN);
                             lv_obj_set_style_text_align(self._lbl_hero_cond, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+                            // FU6-A: long mode/duration/delay from the shared settings; register last.
+                            // FU6-A: режим/длительность/задержка из общих настроек; регистрируем последним.
+                            text_scroll::registerLabel(self._lbl_hero_cond);
                         }
                         self._lbl_hero_feels = lv_label_create(hero_text);
                         if (self._lbl_hero_feels) {
                             lv_label_set_text(self._lbl_hero_feels, "");
-                            wx_set_font(self._lbl_hero_feels, k_font_small);
+                            wx_set_font(self._lbl_hero_feels, font_small());
                             lv_obj_set_style_text_color(self._lbl_hero_feels, pal.text_meta, LV_PART_MAIN);
                             lv_obj_set_style_text_align(self._lbl_hero_feels, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
                         }
@@ -1105,6 +1118,7 @@ void LvglWeatherPage::create_data_block(LvglWeatherPage& self, const YoRadioPale
                     add_metric_cell(self._cont_metrics, YORA_WEATHER_METRIC_GLYPH_PRESSURE,
                                     i18n::text(i18n::TextId::WeatherMetricPressure),
                                     &self._val_pressure, &self._lbl_pressure, pal);
+                    wx_metric_pressure_value_setup(self._val_pressure);
                     add_metric_cell(self._cont_metrics, YORA_WEATHER_METRIC_GLYPH_UMBRELLA,
                                     i18n::text(i18n::TextId::WeatherMetricRain),
                                     &self._val_rain,     &self._lbl_rain,     pal);
@@ -1130,7 +1144,7 @@ void LvglWeatherPage::create_data_block(LvglWeatherPage& self, const YoRadioPale
                 if (self._lbl_hourly_day) {
                     lv_label_set_text(self._lbl_hourly_day,
                                       i18n::text(i18n::TextId::WeatherHourlyNearest));
-                    wx_set_font(self._lbl_hourly_day, k_font_caption);
+                    wx_set_font(self._lbl_hourly_day, font_caption());
                     lv_obj_set_style_text_color(self._lbl_hourly_day, pal.text_meta, LV_PART_MAIN);
                     lv_obj_set_width(self._lbl_hourly_day, LV_PCT(100));
                     lv_label_set_long_mode(self._lbl_hourly_day, LV_LABEL_LONG_CLIP);
@@ -1202,7 +1216,7 @@ void LvglWeatherPage::create_empty_center(LvglWeatherPage& self, const YoRadioPa
                               i18n::text(i18n::TextId::WeatherForecastWaiting));
             lv_label_set_long_mode(self._lbl_message, LV_LABEL_LONG_WRAP);
             lv_obj_set_width(self._lbl_message, LV_PCT(85));
-            wx_set_font(self._lbl_message, k_font_cond);
+            wx_set_font(self._lbl_message, font_condition());
             lv_obj_set_style_text_color(self._lbl_message, pal.text_secondary, LV_PART_MAIN);
             lv_obj_set_style_text_align(self._lbl_message, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
         }
@@ -1232,7 +1246,10 @@ void LvglWeatherPage::create_footer(LvglWeatherPage& self, const YoRadioPalette&
             lv_obj_set_flex_align(self._footer_box, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
             lv_obj_add_flag(self._footer_box, LV_OBJ_FLAG_CLICKABLE);
             lv_obj_clear_flag(self._footer_box, LV_OBJ_FLAG_SCROLLABLE);
-            lv_obj_add_event_cb(self._footer_box, _onFooterRefreshClick, LV_EVENT_CLICKED, &self);
+            // A horizontal swipe started on the pill still belongs to the carousel (Settings/status-line convention).
+            // Горизонтальный свайп, начатый на pill, остаётся за каруселью (как в Settings/status line).
+            lv_obj_add_flag(self._footer_box, LV_OBJ_FLAG_GESTURE_BUBBLE);
+            lv_obj_add_event_cb(self._footer_box, _onFooterReturnToMainClick, LV_EVENT_CLICKED, nullptr);
 
             self._lbl_footer = lv_label_create(self._footer_box);
             if (self._lbl_footer) {
@@ -1241,19 +1258,21 @@ void LvglWeatherPage::create_footer(LvglWeatherPage& self, const YoRadioPalette&
                     wx_format_footer_action(
                         fb, sizeof(fb),
                         i18n::text(i18n::TextId::WeatherForecastNotLoaded),
-                        i18n::text(i18n::TextId::WeatherTapToRefresh), nullptr);
+                        i18n::text(i18n::TextId::WeatherTapToReturnToMain), nullptr);
                     lv_label_set_text(self._lbl_footer, fb);
                 }
-                wx_set_font(self._lbl_footer, k_font_cond);
+                wx_set_font(self._lbl_footer, font_condition());
                 lv_obj_set_style_text_color(self._lbl_footer, pal.text_secondary, LV_PART_MAIN);
                 lv_obj_set_style_text_align(self._lbl_footer, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
                 // A3.2: full-width circular scroll on overflow; tap stays on _footer_box.
                 // A3.2: полная ширина + круговой скролл при переполнении; тап на _footer_box.
-                lv_label_set_long_mode(self._lbl_footer, LV_LABEL_LONG_SCROLL_CIRCULAR);
                 lv_obj_set_width(self._lbl_footer, LV_PCT(100));
                 lv_obj_set_flex_grow(self._lbl_footer, 1);
                 lv_obj_set_style_min_width(self._lbl_footer, 0, LV_PART_MAIN);
                 wgt_footer_pill::make_child_passive(self._lbl_footer);
+                // FU6-A: register last, once width/grow/alignment are final.
+                // FU6-A: регистрируем последним, когда ширина и выравнивание уже заданы.
+                text_scroll::registerLabel(self._lbl_footer);
             }
         }
     }
@@ -1262,36 +1281,32 @@ void LvglWeatherPage::create_footer(LvglWeatherPage& self, const YoRadioPalette&
 // ─────────────────────────────────────────────────────────────────────────────
 // Class methods / Методы класса LvglWeatherPage
 // ─────────────────────────────────────────────────────────────────────────────
-void LvglWeatherPage::_onFooterRefreshClick(lv_event_t* e) {
+// Deferred PageChain navigation shared by every Weather instance; the flag lives outside the page
+// tree because goTo(MAIN) auto-deletes that tree. / Отложенная навигация PageChain; флаг вне дерева
+// страницы, потому что goTo(MAIN) удаляет это дерево.
+static bool s_return_to_main_pending = false;
+
+static void weather_return_to_main_async_cb(void* /*data*/) {
+    s_return_to_main_pending = false;
+    // A swipe may already have left Weather before this ran — never yank the user back to Main.
+    // Свайп мог уже увести с Weather до вызова — не перебрасываем пользователя на Main.
+    if (!isLvglCarouselOnWeatherSlot()) return;
+    goToCarouselPage(PageChain::MAIN_INDEX);
+}
+
+void LvglWeatherPage::_onFooterReturnToMainClick(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    auto* self = static_cast<LvglWeatherPage*>(lv_event_get_user_data(e));
-    if (!self || !self->_lbl_footer) return;
 
-    const uint32_t now = millis();
-    if (now - self->_last_refresh_tap_ms < LvglWeatherPage::kRefreshTapThrottleMs) {
-        return; // throttle spam / антиспам тапов
+    notifyPageChainActivity("weather-return-main");
+    if (s_return_to_main_pending) return;
+
+    // PageChain owns the Weather→Main lifecycle. goTo() synchronously deletes this page tree
+    // (the pill included), so it must run after LVGL finishes this click dispatch.
+    // Жизненным циклом Weather→Main владеет PageChain; goTo() синхронно удаляет дерево страницы
+    // (вместе с pill), поэтому переход выполняем после завершения обработки клика.
+    if (lv_async_call(weather_return_to_main_async_cb, nullptr) == LV_RES_OK) {
+        s_return_to_main_pending = true;
     }
-    self->_last_refresh_tap_ms = now;
-    self->_manual_refresh_pending = true;
-    self->_refresh_pending_since_ms = now;
-
-    // Snapshot version at request time — update() clears pending when it changes.
-    // Версия на момент запроса — update() сбросит pending при изменении.
-    WeatherState snap{};
-    if (weatherGetStateSnapshot(&snap)) {
-        self->_refresh_watch_version = snap.version;
-    } else {
-        self->_refresh_watch_version = 0;
-    }
-
-    weatherRequestManualRefresh(); // flag only — no HTTP in LVGL / только флаг, без HTTP
-    char fb[kFooterTextCap];
-    const bool wxEnabled = config.store.showweather && (strlen(config.store.weatherkey) > 0);
-    const bool haveData = snap.forecast_valid && snap.current.valid;
-    wx_format_footer(fb, sizeof(fb), wxEnabled, haveData, true, false, false,
-                     snap.forecast_updated_at, false, &snap.location);
-    wx_footer_maybe_add_trailing_sep(fb, sizeof(fb), self->_lbl_footer);
-    wx_set_text_if_changed(self->_lbl_footer, fb);
 }
 
 ScreenType LvglWeatherPage::screenType() const {
@@ -1312,9 +1327,6 @@ void LvglWeatherPage::create() {
 
     installCarouselGesturesOnPageRoot(_screen);
 
-#if YORADIO_WEATHER_UI_DIAG
-    wx_diag_dump("after_create", _screen);
-#endif
 }
 
 void LvglWeatherPage::enter() {
@@ -1323,19 +1335,10 @@ void LvglWeatherPage::enter() {
     // A3.2 perf: invalidate cache so the first update() after enter is always a full render.
     // A3.2 perf: сброс кэша — первый update() после входа всегда полный рендер.
     _render_cache_valid = false;
-#if YORADIO_WEATHER_UI_DIAG
-    wx_diag_dump("enter_before_update", _screen);
-#endif
     update();
 }
 
 void LvglWeatherPage::exit() {
-#if YORADIO_WEATHER_UI_DIAG
-    // W2F: snapshot before leaving. PageChain auto-deletes this screen on the next switch
-    // (lv_scr_load_anim auto_del) then calls releaseAfterAutoDelete() — pool recovers.
-    // W2F: снимок перед уходом. PageChain удалит экран при переходе (auto_del) и вызовет release.
-    wx_diag_dump("before_leave", _screen);
-#endif
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1373,8 +1376,6 @@ struct LvglWeatherPage::WeatherRenderDecision {
 
 // Pure derivation — no snapshot read, no member mutation, no LVGL, no formatting, no network.
 // Чистое вычисление — без чтения снапшота, мутации членов, LVGL, форматирования и сети.
-// NB: show_refreshing_footer and view_sig are captured here, BEFORE _resolveManualRefresh, so they
-// reflect the pre-resolve _manual_refresh_pending exactly as the baseline did.
 LvglWeatherPage::WeatherViewState
 LvglWeatherPage::_deriveViewState(const WeatherState& snap, uint32_t now_ms) const {
     WeatherViewState v{};
@@ -1395,7 +1396,7 @@ LvglWeatherPage::_deriveViewState(const WeatherState& snap, uint32_t now_ms) con
     v.resource_deferred =
         v.wx_enabled && (snap.last_error == WeatherLastError::InternalLow);
     v.show_refreshing_footer =
-        v.have_data && (_manual_refresh_pending || snap.fetch_in_progress);
+        v.have_data && snap.fetch_in_progress;
 
     // A3.2 perf: compact visible-state signature — detects all transitions that require a body/footer rebuild.
     // A3.2 perf: компактная сигнатура видимого состояния; ловит все переходы, требующие rebuild.
@@ -1426,24 +1427,6 @@ LvglWeatherPage::_deriveViewState(const WeatherState& snap, uint32_t now_ms) con
     return v;
 }
 
-// W-R3: clear pending on attempt completion, new published version, or timeout. Affects FUTURE
-// passes only — this pass already captured show_refreshing_footer pre-resolve (baseline order).
-// W-R3: сброс pending при завершении попытки, новой версии или таймауте; влияет на будущие проходы.
-void LvglWeatherPage::_resolveManualRefresh(const WeatherState& snap, uint32_t now_ms) {
-    if (_manual_refresh_pending) {
-        const bool fetch_done = !snap.fetch_in_progress;
-        const int32_t attempt_after_request =
-            (int32_t)(snap.last_attempt_at_ms - _refresh_pending_since_ms);
-        if (fetch_done && snap.last_attempt_at_ms != 0u && attempt_after_request >= 0) {
-            _manual_refresh_pending = false;
-        } else if (snap.version != _refresh_watch_version) {
-            _manual_refresh_pending = false;
-        } else if (now_ms - _refresh_pending_since_ms >= kRefreshPendingTimeoutMs) {
-            _manual_refresh_pending = false;
-        }
-    }
-}
-
 // Dirty-category derivation / Вычисление категорий изменений.
 LvglWeatherPage::WeatherRenderDecision
 LvglWeatherPage::_makeRenderDecision(const WeatherState& snap, const WeatherViewState& view) const {
@@ -1468,6 +1451,14 @@ void LvglWeatherPage::_updateFooterText(const WeatherState& snap, const WeatherV
                      view.resource_deferred,
                      snap.forecast_updated_at, view.unavailable_without_data,
                      &snap.location);
+    // Resolve footer geometry first: the empty-state path (unlike _renderWeatherData) forces no layout,
+    // so on enter() the label is still 0 px wide — the overflow separator is skipped, the text equals
+    // the create() placeholder and text_scroll is never notified, leaving the line static.
+    // Сначала валидируем геометрию: пустое состояние layout не форсирует, ширина лейбла 0 — разделитель
+    // не добавляется, текст совпадает с placeholder из create(), text_scroll не уведомляется.
+    if (_lbl_footer && lv_obj_get_content_width(_lbl_footer) <= 0) {
+        lv_obj_update_layout(_lbl_footer);
+    }
     wx_footer_maybe_add_trailing_sep(footer_buf, sizeof(footer_buf), _lbl_footer);
     wx_set_text_if_changed(_lbl_footer, footer_buf);
 }
@@ -1533,8 +1524,10 @@ void LvglWeatherPage::_renderWeatherData(const WeatherState& snap) {
     wx_set_text_if_changed(_val_wind, buf);
     wx_format_checked(buf, sizeof(buf), "--", "%u%%", static_cast<unsigned>(cur.humidity));
     wx_set_text_if_changed(_val_humidity, buf);
-    wx_format_checked(buf, sizeof(buf), "--", "%u hPa",
-                      static_cast<unsigned>(cur.pressure_hpa));
+    // Canonical state stays hPa; convert to mmHg for display only (weatherHpaToMmHg, weather_state.h).
+    // Внутреннее состояние остаётся в hPa; в мм.рт.ст. переводим только для отображения.
+    wx_format_checked(buf, sizeof(buf), "--", "%d mmHg",
+                      weatherHpaToMmHg(static_cast<float>(cur.pressure_hpa)));
     wx_set_text_if_changed(_val_pressure, buf);
     wx_format_checked(buf, sizeof(buf), "--", "%u%%",
                       static_cast<unsigned>(cur.rain_probability));
@@ -1629,27 +1622,14 @@ void LvglWeatherPage::update() {
         return; // writer busy → keep last rendered state / писатель занят — оставляем кадр
     }
 
-    // Single time read per pass — used by age/stale, minute bucket and pending timeout (same formulas).
-    // Одно чтение времени за проход — для age/stale, minute bucket и таймаута (формулы те же).
+    // Single time read per pass — used by age/stale and minute bucket (same formulas).
+    // Одно чтение времени за проход — для age/stale и minute bucket (формулы те же).
     const uint32_t now_ms = millis();
 
-    // 1) Derive visible state (pre-resolve: show_refreshing_footer + view_sig use current pending).
+    // 1) Derive visible state.
     const WeatherViewState view = _deriveViewState(s_snap, now_ms);
 
-#if YORADIO_WEATHER_UI_DIAG
-    // Log once per published version when data is present — not every 1 Hz frame (avoid UART churn).
-    // Лог раз на версию публикации при наличии данных — не каждый кадр (без флуда UART).
-    static uint32_t s_diag_last_ver = 0;
-    if (view.have_data && s_snap.version != s_diag_last_ver) {
-        s_diag_last_ver = s_snap.version;
-        wx_diag_dump("update_with_data", _screen);
-    }
-#endif
-
-    // 2) Resolve manual-refresh lifecycle (future passes only; footer this pass already captured).
-    _resolveManualRefresh(s_snap, now_ms);
-
-    // 3) Render decision (dirty categories).
+    // 2) Render decision (dirty categories).
     const WeatherRenderDecision decision = _makeRenderDecision(s_snap, view);
 
     if (!decision.full_render_needed && !decision.footer_only_needed) {
@@ -1733,7 +1713,7 @@ void LvglWeatherPage::liveReapplyTheme() {
         lv_obj_set_style_border_color(_cont_hourly, pal.divider, LV_PART_MAIN);
     }
 
-    // Hourly row icons use k_font_hourly_icon (28 px); daily wx icons use 36 px.
+    // Hourly row icons use font_hourly_icon() (28 px); daily wx icons use 36 px.
     for (int i = 0; i < kHourlyCells; ++i) {
         paint(_hourly[i].time, pal.text_secondary);
         paint(_hourly[i].icon, pal.status_weather_icon);
@@ -1764,8 +1744,8 @@ void LvglWeatherPage::liveReapplyTheme() {
                 const lv_font_t* f = lv_obj_get_style_text_font(ch, LV_PART_MAIN);
                 // Retint caption font (time/day/pop labels) and metric icon glyphs.
                 // Перекраска шрифта caption и глифов метрических иконок.
-                if (f == static_cast<const lv_font_t*>(k_font_caption) ||
-                    f == static_cast<const lv_font_t*>(k_font_metric_icon)) {
+                if (f == static_cast<const lv_font_t*>(font_caption()) ||
+                    f == static_cast<const lv_font_t*>(font_metric_icon())) {
                     lv_obj_set_style_text_color(ch, pal.text_secondary, LV_PART_MAIN);
                 }
             } else if (lv_obj_get_height(ch) == 1 &&

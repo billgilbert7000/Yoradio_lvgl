@@ -1,4 +1,7 @@
 #include <stdarg.h>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
 #include "WiFi.h"
 
 #include "config.h"
@@ -6,9 +9,104 @@
 #include "network.h"
 #include "display.h"
 #include "telnet.h"
+#include "sleep_timer.h"
 #include "../ai/ai_log.h"  // Для aiLogSetBootDone / For aiLogSetBootDone
 
 Telnet telnet;
+
+namespace {
+
+struct ParsedMinutesCommand {
+  bool matched = false;
+  bool valid = false;
+  bool has_value = false;
+  uint16_t value = 0;
+};
+
+// Exact runtime command parser: command boundary, digits only, no negative/overflow/junk tail.
+// Точный parser runtime-команд: граница имени, только цифры, без minus/overflow/мусорного хвоста.
+ParsedMinutesCommand parse_minutes_command(const char* input, const char* command,
+                                           bool allow_bare) {
+  ParsedMinutesCommand parsed;
+  if (!input || !command) return parsed;
+  const size_t command_len = strlen(command);
+  if (strncmp(input, command, command_len) != 0) return parsed;
+  const char boundary = input[command_len];
+  if (boundary != '\0' && boundary != ' ') return parsed;
+  parsed.matched = true;
+  if (boundary == '\0') {
+    parsed.valid = allow_bare;
+    return parsed;
+  }
+
+  const char* value_text = input + command_len;
+  while (*value_text == ' ') ++value_text;
+  if (*value_text < '0' || *value_text > '9') return parsed;
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long value = strtoul(value_text, &end, 10);
+  if (errno != 0 || !end || *end != '\0' || value > kTimerMaxMinutes) return parsed;
+  parsed.valid = true;
+  parsed.has_value = true;
+  parsed.value = static_cast<uint16_t>(value);
+  return parsed;
+}
+
+ParsedMinutesCommand parse_timer_aliases(const char* input, const char* command,
+                                         const char* cli_command, bool allow_bare) {
+  ParsedMinutesCommand parsed = parse_minutes_command(input, command, allow_bare);
+  if (!parsed.matched) parsed = parse_minutes_command(input, cli_command, allow_bare);
+  return parsed;
+}
+
+struct ParsedLegacySleep {
+  bool matched = false;
+  bool valid = false;
+  bool delayed = false;
+  uint16_t wake_minutes = 0;
+  uint16_t after_minutes = 0;
+};
+
+ParsedLegacySleep parse_legacy_sleep(const char* input) {
+  ParsedLegacySleep parsed;
+  if (!input) return parsed;
+  parsed.matched = strncmp(input, "sleep ", 6) == 0 || strncmp(input, "sleep(", 6) == 0 ||
+                   strncmp(input, "cli.sleep(", 10) == 0;
+  if (!parsed.matched) return parsed;
+
+  int wake = 0;
+  int after = 0;
+  int consumed = -1;
+  const bool two =
+      (sscanf(input, "sleep(%d,%d)%n", &wake, &after, &consumed) == 2 &&
+       consumed >= 0 && input[consumed] == '\0') ||
+      (sscanf(input, "cli.sleep(\"%d\",\"%d\")%n", &wake, &after, &consumed) == 2 &&
+       consumed >= 0 && input[consumed] == '\0') ||
+      (sscanf(input, "sleep %d %d%n", &wake, &after, &consumed) == 2 &&
+       consumed >= 0 && input[consumed] == '\0');
+  if (two) {
+    parsed.delayed = true;
+    parsed.valid = wake > 0 && wake <= kTimerMaxMinutes &&
+                   after > 0 && after <= kTimerMaxMinutes;
+  } else {
+    consumed = -1;
+    const bool one =
+        (sscanf(input, "sleep(%d)%n", &wake, &consumed) == 1 &&
+         consumed >= 0 && input[consumed] == '\0') ||
+        (sscanf(input, "cli.sleep(\"%d\")%n", &wake, &consumed) == 1 &&
+         consumed >= 0 && input[consumed] == '\0') ||
+        (sscanf(input, "sleep %d%n", &wake, &consumed) == 1 &&
+         consumed >= 0 && input[consumed] == '\0');
+    parsed.valid = one && wake > 0 && wake <= kTimerMaxMinutes;
+  }
+  if (parsed.valid) {
+    parsed.wake_minutes = static_cast<uint16_t>(wake);
+    parsed.after_minutes = static_cast<uint16_t>(after);
+  }
+  return parsed;
+}
+
+}  // namespace
 
 void Telnet::printDiagBody(uint8_t clientId, const char* body) {
   if (!body || body[0] == '\0') return;
@@ -196,7 +294,7 @@ void Telnet::info() {
   if (player.status() == PLAYING) {
     telnet.printf("##CLI.META#: %s\n",  config.station.title);
   }
-  telnet.printf("##CLI.VOL#: %d\n", config.store.volume);
+  telnet.printf("##CLI.VOL#: %d\n", player.audibleVolume());
   if (player.status() == PLAYING) {
     telnet.printf("##CLI.PLAYING#\n");
   } else {
@@ -207,6 +305,112 @@ void Telnet::info() {
 
 void Telnet::on_input(const char* str, uint8_t clientId) {
   if (strlen(str) == 0) return;
+
+  auto print_timer_failure = [&](TimerCommandResult result) {
+    switch (result) {
+      case TimerCommandResult::ConflictRadioActive:
+        printf(clientId, "timer conflict: cancel RADIO timer first\n> ");
+        break;
+      case TimerCommandResult::ConflictDeepSleepActive:
+        printf(clientId, "timer conflict: cancel DEEP SLEEP timer first\n> ");
+        break;
+      case TimerCommandResult::ShutdownInProgress:
+        printf(clientId, "deep sleep shutdown already in progress\n> ");
+        break;
+      case TimerCommandResult::RadioStartNotAfterStop:
+        printf(clientId, "radio start must be later than radio stop\n> ");
+        break;
+      case TimerCommandResult::WakeIntervalRequired:
+        printf(clientId, "deep sleep wake is ON; set a non-zero wake interval first\n> ");
+        break;
+      default:
+        printf(clientId, "##CMD_ERROR#\tinvalid timer command <%s>\n> ", str);
+        break;
+    }
+  };
+
+  // Runtime timer commands stay ahead of network.status so the identical parser works over
+  // Serial without Wi-Fi. They change runtime snapshots only, never persisted UI presets.
+  // Runtime-команды идут до network.status: один parser для Serial/telnet, пресеты не меняются.
+  ParsedMinutesCommand parsed =
+      parse_timer_aliases(str, "sleeptimer", "cli.sleeptimer", false);
+  if (parsed.matched) {
+    if (!parsed.valid || !parsed.has_value) {
+      print_timer_failure(TimerCommandResult::InvalidMinutes);
+      return;
+    }
+    if (parsed.value == 0) {
+      timer_cancel_radio_stop();
+      printf(clientId, "radio stop timer cancelled\n> ");
+      return;
+    }
+    const TimerCommandResult result = timer_schedule_radio_stop(parsed.value);
+    if (result == TimerCommandResult::Applied) {
+      printf(clientId, "radio stop timer set: %u min\n> ",
+             static_cast<unsigned>(parsed.value));
+    } else {
+      print_timer_failure(result);
+    }
+    return;
+  }
+
+  parsed = parse_timer_aliases(str, "playtimer", "cli.playtimer", false);
+  if (parsed.matched) {
+    if (!parsed.valid || !parsed.has_value) {
+      print_timer_failure(TimerCommandResult::InvalidMinutes);
+      return;
+    }
+    if (parsed.value == 0) {
+      timer_cancel_radio_start();
+      printf(clientId, "radio start timer cancelled\n> ");
+      return;
+    }
+    const TimerCommandResult result = timer_schedule_radio_start(parsed.value);
+    if (result == TimerCommandResult::Applied) {
+      printf(clientId, "radio start timer set: %u min\n> ",
+             static_cast<unsigned>(parsed.value));
+    } else {
+      print_timer_failure(result);
+    }
+    return;
+  }
+
+  parsed = parse_timer_aliases(str, "deepsleep", "cli.deepsleep", true);
+  if (parsed.matched) {
+    if (!parsed.valid) {
+      print_timer_failure(TimerCommandResult::InvalidMinutes);
+      return;
+    }
+    if (!parsed.has_value) {
+      const TimerCommandResult result =
+          timer_request_deep_sleep_now(DeepSleepWakeRequest::persistent());
+      if (result == TimerCommandResult::Applied) {
+        printf(clientId, "deep sleep requested\n> ");
+      } else {
+        print_timer_failure(result);
+      }
+      return;
+    }
+    if (parsed.value == 0) {
+      const TimerCommandResult result = timer_cancel_deep_sleep();
+      if (result == TimerCommandResult::Cancelled) {
+        printf(clientId, "deep sleep timer cancelled\n> ");
+      } else {
+        print_timer_failure(result);
+      }
+      return;
+    }
+    const TimerCommandResult result = timer_schedule_deep_sleep(
+        parsed.value, DeepSleepWakeRequest::persistent());
+    if (result == TimerCommandResult::Applied) {
+      printf(clientId, "deep sleep timer set: %u min\n> ",
+             static_cast<unsigned>(parsed.value));
+    } else {
+      print_timer_failure(result);
+    }
+    return;
+  }
+
   if(network.status == CONNECTED){
     if (strcmp(str, "cli.prev") == 0 || strcmp(str, "prev") == 0) {
       player.prev();
@@ -220,6 +424,24 @@ void Telnet::on_input(const char* str, uint8_t clientId) {
       player.toggle();
       return;
     }
+    // Semantic MUTE over telnet/serial - same central action a physical BTN_MUTE or future IR calls.
+    // Reply is intentionally silent (like prev/next/toggle): Player::_applyMuteRequest emits the
+    // authoritative ##CLI.MUTE# / ##CLI.VOL# a few ms later once the queued request is processed.
+    // Семантический MUTE по telnet/serial - то же центральное действие, что кнопка / будущий IR.
+    if (strncmp(str, "mute", 4) == 0 || strncmp(str, "cli.mute", 8) == 0) {
+      const char* arg = str + (strncmp(str, "cli.", 4) == 0 ? 8 : 4);
+      while (*arg == ' ') arg++;
+      if (*arg == '\0' || strcmp(arg, "toggle") == 0) {
+        player.requestMute(PMUTE_TOGGLE);
+      } else if (strcmp(arg, "on") == 0 || strcmp(arg, "1") == 0) {
+        player.requestMute(PMUTE_ON);
+      } else if (strcmp(arg, "off") == 0 || strcmp(arg, "0") == 0) {
+        player.requestMute(PMUTE_OFF);
+      } else {
+        printf(clientId, "usage: mute [on|off|toggle]\n> ");
+      }
+      return;
+    }
     if (strcmp(str, "cli.stop") == 0 || strcmp(str, "stop") == 0) {
       player.sendCommand({PR_STOP, 0});
       //info();
@@ -230,7 +452,7 @@ void Telnet::on_input(const char* str, uint8_t clientId) {
       return;
     }
     if (strcmp(str, "cli.vol") == 0 || strcmp(str, "vol") == 0) {
-      printf(clientId, "##CLI.VOL#: %d\n> ", config.store.volume);
+      printf(clientId, "##CLI.VOL#: %d\n> ", player.audibleVolume());
       return;
     }
     if (strcmp(str, "cli.vol-") == 0 || strcmp(str, "vol-") == 0) {
@@ -304,7 +526,7 @@ void Telnet::on_input(const char* str, uint8_t clientId) {
       if (player.status() == PLAYING) {
         printf(clientId, "##CLI.META#: %s\n", config.station.title);
       }
-      printf(clientId, "##CLI.VOL#: %d\n", config.store.volume);
+      printf(clientId, "##CLI.VOL#: %d\n", player.audibleVolume());
       if (player.status() == PLAYING) {
         printf(clientId, "##CLI.PLAYING#\n");
       } else {
@@ -374,21 +596,29 @@ void Telnet::on_input(const char* str, uint8_t clientId) {
       config.setBrightness(true);
       return;
     }
-    if (sscanf(str, "sleep(%d,%d)", &tzh, &tzm) == 2 || sscanf(str, "cli.sleep(\"%d\",\"%d\")", &tzh, &tzm) == 2 || sscanf(str, "sleep %d %d", &tzh, &tzm) == 2) {
-      if(tzh>0 && tzm>0) {
-        printf(clientId, "sleep for %d minutes after %d minutes ...\n> ", tzh, tzm);
-        config.sleepForAfter(tzh, tzm);
-      }else{
+    const ParsedLegacySleep legacy_sleep = parse_legacy_sleep(str);
+    if (legacy_sleep.matched) {
+      if (!legacy_sleep.valid) {
         printf(clientId, "##CMD_ERROR#\tunknown command <%s>\n> ", str);
+        return;
       }
-      return;
-    }
-    if (sscanf(str, "sleep(%d)", &tzh) == 1 || sscanf(str, "cli.sleep(\"%d\")", &tzh) == 1 || sscanf(str, "sleep %d", &tzh) == 1) {
-      if(tzh>0) {
-        printf(clientId, "sleep for %d minutes ...\n> ", tzh);
-        config.sleepForAfter(tzh);
-      }else{
-        printf(clientId, "##CMD_ERROR#\tunknown command <%s>\n> ", str);
+      const DeepSleepWakeRequest wake =
+          DeepSleepWakeRequest::explicitMinutes(legacy_sleep.wake_minutes);
+      const TimerCommandResult result =
+          legacy_sleep.delayed
+              ? timer_schedule_deep_sleep(legacy_sleep.after_minutes, wake)
+              : timer_request_deep_sleep_now(wake);
+      if (result == TimerCommandResult::Applied) {
+        if (legacy_sleep.delayed) {
+          printf(clientId, "sleep for %u minutes after %u minutes ...\n> ",
+                 static_cast<unsigned>(legacy_sleep.wake_minutes),
+                 static_cast<unsigned>(legacy_sleep.after_minutes));
+        } else {
+          printf(clientId, "sleep for %u minutes ...\n> ",
+                 static_cast<unsigned>(legacy_sleep.wake_minutes));
+        }
+      } else {
+        print_timer_failure(result);
       }
       return;
     }
